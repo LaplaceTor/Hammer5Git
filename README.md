@@ -5,11 +5,15 @@
 **专为 Counter-Strike 2 (CS2) Hammer 关卡设计打造的自动化 Git 版本管理与影子仓库工具**
 
 [![Build and Package](https://github.com/LaplaceTor/Hammer5Git/actions/workflows/package.yml/badge.svg)](https://github.com/LaplaceTor/Hammer5Git/actions/workflows/package.yml)
+[![Status](https://img.shields.io/badge/Status-Early%20Development-orange.svg)](https://github.com/LaplaceTor/Hammer5Git)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6.svg)](https://github.com/LaplaceTor/Hammer5Git)
 [![.NET](https://img.shields.io/badge/.NET-10.0-512BD4.svg)](https://dotnet.microsoft.com/)
 
 </div>
+
+> [!NOTE]
+> **开发阶段说明**：本项目目前仍处于**早期开发阶段（Early Development）**。功能、架构和 UI 交互仍在积极迭代中，可能会存在未覆盖的边界情况或发生较大变动。在重要地图工程中使用时，建议保持常规的手动备份习惯。非常欢迎提交 Issue 反馈问题与建议！
 
 ---
 
