@@ -1,0 +1,53 @@
+<Project>
+
+  <!--
+    背景：Windows App SDK (WinUI 3) 的 PRI 生成任务默认从
+        $(MSBuildExtensionsPath)\Microsoft\VisualStudio\v$(VisualStudioVersion)\AppxPackage\
+    加载 Microsoft.Build.Packaging.Pri.Tasks.dll。
+    用 Visual Studio 自带的 MSBuild 构建时该路径成立；用 `dotnet build`（SDK 版 MSBuild）时
+    MSBuildExtensionsPath 指向 dotnet SDK 目录，其中没有 AppxPackage，于是报
+        MSB4062 未能加载任务 "Microsoft.Build.Packaging.Pri.Tasks.ExpandPriContent"
+
+    这里在 NuGet 包 targets 之前（props 早于 .targets 导入）把真实路径填好。
+    包内取值都带 Condition="'$(AppxMSBuildToolsPath)' == ''"，因此我们的值优先；
+    命令行显式传 -p:AppxMSBuildToolsPath=... 时同样不会被覆盖。
+
+    取值路径须以 "/" 结尾：包内是 $(AppxMSBuildToolsPath)Microsoft.Build.AppxPackage.dll
+    直接相接、不补分隔符。
+  -->
+
+  <PropertyGroup>
+    <!-- 默认路径命中时不介入（用 VS 自带 MSBuild 构建的正常情形） -->
+    <_PriTaskDefaultPath>$(MSBuildExtensionsPath)\Microsoft\VisualStudio\v$(VisualStudioVersion)\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll</_PriTaskDefaultPath>
+
+    <!-- 1. 优先检测 VS 2022 常见安装路径 (GitHub Actions windows-latest / 绝大多数 CI 与本地环境) -->
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and Exists('$(ProgramFiles)\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(ProgramFiles)\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage/</AppxMSBuildToolsPath>
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and Exists('$(ProgramFiles)\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(ProgramFiles)\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage/</AppxMSBuildToolsPath>
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and Exists('$(ProgramFiles)\Microsoft Visual Studio\2022\Professional\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(ProgramFiles)\Microsoft Visual Studio\2022\Professional\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage/</AppxMSBuildToolsPath>
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and Exists('$(ProgramFiles)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(ProgramFiles)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage/</AppxMSBuildToolsPath>
+
+    <!-- 2. 优先检测 VS 18 / 次世代 VS 常见安装路径 -->
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and Exists('$(ProgramFiles)\Microsoft Visual Studio\18\Community\MSBuild\Microsoft\VisualStudio\v18.0\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(ProgramFiles)\Microsoft Visual Studio\18\Community\MSBuild\Microsoft\VisualStudio\v18.0\AppxPackage/</AppxMSBuildToolsPath>
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and Exists('$(ProgramFiles)\Microsoft Visual Studio\18\Enterprise\MSBuild\Microsoft\VisualStudio\v18.0\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(ProgramFiles)\Microsoft Visual Studio\18\Enterprise\MSBuild\Microsoft\VisualStudio\v18.0\AppxPackage/</AppxMSBuildToolsPath>
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and Exists('$(ProgramFiles)\Microsoft Visual Studio\18\Professional\MSBuild\Microsoft\VisualStudio\v18.0\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(ProgramFiles)\Microsoft Visual Studio\18\Professional\MSBuild\Microsoft\VisualStudio\v18.0\AppxPackage/</AppxMSBuildToolsPath>
+
+    <!-- 3. 检测 32 位目录结构 -->
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and Exists('$(ProgramFiles(x86))\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(ProgramFiles(x86))\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage/</AppxMSBuildToolsPath>
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and Exists('$(ProgramFiles(x86))\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(ProgramFiles(x86))\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VisualStudio\v17.0\AppxPackage/</AppxMSBuildToolsPath>
+
+    <!-- 4. 动态遍历探测兜底 -->
+    <_VsInstallRoots Condition="'$(AppxMSBuildToolsPath)' == '' and !Exists('$(_PriTaskDefaultPath)') and Exists('$(ProgramFiles)\Microsoft Visual Studio')">$([System.IO.Directory]::GetDirectories('$(ProgramFiles)\Microsoft Visual Studio'))</_VsInstallRoots>
+    <_VsInstallRoot Condition="'$(_VsInstallRoots)' != ''">$([System.String]::Copy('$(_VsInstallRoots)').Split(';')[0])</_VsInstallRoot>
+    <_VsEditions Condition="'$(_VsInstallRoot)' != '' and Exists('$(_VsInstallRoot)')">$([System.IO.Directory]::GetDirectories('$(_VsInstallRoot)'))</_VsEditions>
+    <_VsEdition Condition="'$(_VsEditions)' != ''">$([System.String]::Copy('$(_VsEditions)').Split(';')[0])</_VsEdition>
+    <_VsTaskVersions Condition="'$(_VsEdition)' != '' and Exists('$(_VsEdition)\MSBuild\Microsoft\VisualStudio')">$([System.IO.Directory]::GetDirectories('$(_VsEdition)\MSBuild\Microsoft\VisualStudio', 'v*'))</_VsTaskVersions>
+    <_VsTaskVersion Condition="'$(_VsTaskVersions)' != ''">$([System.String]::Copy('$(_VsTaskVersions)').Split(';')[0])</_VsTaskVersion>
+    <AppxMSBuildToolsPath Condition="'$(AppxMSBuildToolsPath)' == '' and '$(_VsTaskVersion)' != '' and Exists('$(_VsTaskVersion)\AppxPackage\Microsoft.Build.Packaging.Pri.Tasks.dll')">$(_VsTaskVersion)\AppxPackage/</AppxMSBuildToolsPath>
+  </PropertyGroup>
+
+  <!-- 多个 VS 版本/版本共存时取到的不一定带 AppxPackage 负载；定位失败就明确提示，不静默跳过 -->
+  <Target Name="_WarnMissingAppxTools" BeforeTargets="PrepareForBuild" Condition="'$(UseWinUI)' == 'true' and '$(AppxMSBuildToolsPath)' == ''">
+    <Warning Text="未定位到 Visual Studio 的 AppxPackage MSBuild 任务目录：WinUI 项目的 PRI 生成会失败。请安装 VS 的「Windows 应用开发 / UWP」工作负载，或显式传 -p:AppxMSBuildToolsPath=&quot;C:/.../MSBuild/Microsoft/VisualStudio/v18.0/AppxPackage/&quot;（务必以 / 结尾）。" />
+  </Target>
+
+</Project>

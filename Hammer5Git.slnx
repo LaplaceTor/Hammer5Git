@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Hammer5Git.Main/Hammer5Git.Main.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/Hammer5Git.App/Hammer5Git.App.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/Hammer5Git.Core/Hammer5Git.Core.csproj" />
+  </Folder>
+</Solution>

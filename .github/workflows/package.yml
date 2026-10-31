@@ -1,0 +1,273 @@
+name: Build and Package
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: '是否发布到 GitHub Releases (仅当手动触发且需要发版时勾选)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    name: Build & Package (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Resolve Version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -match '^refs/tags/v?([0-9]+\.[0-9]+\.[0-9]+.*)$') {
+            $ver = $Matches[1]
+          } elseif ($env:GITHUB_REF -match '^refs/heads/') {
+            $ver = "1.0.0-ci-$env:GITHUB_RUN_NUMBER"
+          } else {
+            $ver = "1.0.0-dev"
+          }
+          Write-Host "Resolved Version: $ver"
+          "version=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Build & Package (Self-Contained & Framework-Dependent)
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          $project = "src/Hammer5Git.Main/Hammer5Git.Main.csproj"
+          $outRoot = "artifacts"
+
+          New-Item -ItemType Directory -Force -Path $outRoot | Out-Null
+
+          # 清理函数：剔除全部未使用的 WinAppSDK 冗余组件、未使用的 .NET BCL 模块及小语种语言包
+          function Prune-UnusedArtifacts($dir, [bool]$isSelfContained) {
+            $redundantCommon = @(
+              "RestartAgent.exe",
+              "createdump.exe",
+              "*.winmd",
+              "WindowsAppRuntime.png",
+              "WebView2Loader.dll",
+              "Microsoft.Web.WebView2.*",
+              "Microsoft.WindowsAppRuntime.Bootstrap*",
+              "Microsoft.Windows.ApplicationModel.DynamicDependency.*",
+              "PushNotificationsLongRunningTask.ProxyStub.dll",
+              "Microsoft.Windows.Widgets.*",
+              "Microsoft.Windows.PushNotifications.*",
+              "Microsoft.Windows.AppNotifications.*",
+              "Microsoft.Windows.System.Power.*",
+              "Microsoft.Windows.Security.AccessControl.*",
+              "Microsoft.Windows.Storage.*",
+              "Microsoft.Windows.Management.Deployment.*",
+              "Microsoft.Windows.System.*",
+              "Microsoft.Windows.AppLifecycle.*",
+              "Microsoft.Windows.ApplicationModel.WindowsAppRuntime.*",
+              "Microsoft.WindowsAppRuntime.Insights.Resource.dll",
+              "WindowsAppRuntime.DeploymentExtensions.OneCore.dll",
+              "WindowsAppSdk.AppxDeploymentExtensions.*",
+              "Microsoft.UI.Xaml.Phone.dll",
+              "DwmSceneI.dll",
+              "Microsoft.Graphics.Display.dll",
+              "*.pdb"
+            )
+            foreach ($pat in $redundantCommon) {
+              Get-ChildItem -Path $dir -Filter $pat -Recurse -File -ErrorAction SilentlyContinue | Remove-Item -Force
+            }
+
+            if ($isSelfContained) {
+              $redundantBcl = @(
+                "mscordbi.dll",
+                "mscordaccore.dll",
+                "mscordaccore_amd64_amd64_*.dll",
+                "Microsoft.DiaSymReader.Native.amd64.dll",
+                "clrgcexp.dll",
+                "clretwrc.dll",
+                "Microsoft.VisualBasic.*",
+                "Microsoft.CSharp.dll",
+                "System.Runtime.InteropServices.JavaScript.dll",
+                "System.Data.*",
+                "System.Drawing.*",
+                "System.Web.*",
+                "System.ServiceModel.*",
+                "System.Transactions.*",
+                "System.Formats.Tar.dll",
+                "System.Formats.Asn1.dll",
+                "System.IO.Compression.Brotli.dll",
+                "System.IO.Pipes.*",
+                "System.IO.MemoryMappedFiles.dll",
+                "System.IO.IsolatedStorage.dll",
+                "System.Net.Quic.dll",
+                "msquic.dll",
+                "System.Net.Mail.dll",
+                "System.Net.Ping.dll",
+                "System.Net.Requests.dll",
+                "System.Net.WebClient.dll",
+                "System.Net.WebSockets.*",
+                "System.Net.ServerSentEvents.dll",
+                "System.Net.HttpListener.dll",
+                "System.Resources.Writer.dll",
+                "System.Resources.Reader.dll",
+                "System.Private.Xml.dll",
+                "System.Private.Xml.Linq.dll",
+                "System.Private.DataContractSerialization.dll",
+                "System.Xml.*"
+              )
+              foreach ($pat in $redundantBcl) {
+                Get-ChildItem -Path $dir -Filter $pat -Recurse -File -ErrorAction SilentlyContinue | Remove-Item -Force
+              }
+            }
+
+            Get-ChildItem -Path $dir -Directory | Where-Object { $_.Name -like "*-*" -and $_.Name -notin @("zh-CN", "zh-TW", "en-us") } | Remove-Item -Recurse -Force
+          }
+
+          # ----------------------------------------------------
+          # 0. 动态探测并定位 AppxPackage MSBuild PRI 工具链目录
+          # ----------------------------------------------------
+          $appxDll = $null
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $found = & $vswhere -all -products * -find "**/Microsoft.Build.Packaging.Pri.Tasks.dll" 2>$null
+            if ($found) {
+              $appxDll = $found | Select-Object -First 1
+            }
+          }
+          if (-not $appxDll) {
+            $appxDll = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio" -Filter "Microsoft.Build.Packaging.Pri.Tasks.dll" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName }
+          }
+          if (-not $appxDll -and (Test-Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio")) {
+            $appxDll = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio" -Filter "Microsoft.Build.Packaging.Pri.Tasks.dll" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName }
+          }
+
+          $appxArgs = @()
+          if ($appxDll) {
+            $appxDir = (Split-Path -Parent $appxDll).Replace('\', '/') + '/'
+            Write-Host ">>> 定位到 AppxMSBuildToolsPath: $appxDir" -ForegroundColor Green
+            $appxArgs = @("-p:AppxMSBuildToolsPath=$appxDir")
+          } else {
+            Write-Warning ">>> 未能提前定位到 Microsoft.Build.Packaging.Pri.Tasks.dll，将依赖 Directory.Build.props 探测"
+          }
+
+          # ----------------------------------------------------
+          # 1. 完全自包含版 (免安装运行库，解压即用)
+          # ----------------------------------------------------
+          $scdDir = "$outRoot/Hammer5Git-v$ver-win-x64-selfcontained"
+          $scdZip = "$outRoot/Hammer5Git-v$ver-win-x64-selfcontained.zip"
+
+          Write-Host ">>> 正在构建自包含独立版..." -ForegroundColor Cyan
+          dotnet publish $project `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:WindowsAppSDKSelfContained=true `
+            -p:Version=$ver `
+            -p:DebugType=none `
+            -p:DebugSymbols=false `
+            @appxArgs `
+            -o $scdDir
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # 校验并补齐 PRI / XBF 资源 (避免 WinUI 运行时找不到 XAML 页面)
+          if (-not (Test-Path "$scdDir/Hammer5Git.pri") -and (Test-Path "dist/Hammer5Git.pri")) {
+            Copy-Item "dist/Hammer5Git.pri" $scdDir -Force
+          }
+          Get-ChildItem -Path "dist" -Filter "*.xbf" -ErrorAction SilentlyContinue | ForEach-Object {
+            if (-not (Test-Path "$scdDir/$($_.Name)")) {
+              Copy-Item $_.FullName $scdDir -Force
+            }
+          }
+
+          # 深度剔除全部未使用的内置组件与运行时
+          Prune-UnusedArtifacts -dir $scdDir -isSelfContained $true
+
+          Write-Host ">>> 压缩自包含版为 Zip..." -ForegroundColor Cyan
+          Compress-Archive -Path "$scdDir/*" -DestinationPath $scdZip -CompressionLevel Optimal
+
+          # ----------------------------------------------------
+          # 2. 框架依赖版 (轻量级，依赖 .NET 10 Runtime)
+          # ----------------------------------------------------
+          $fddDir = "$outRoot/Hammer5Git-v$ver-win-x64-dependent"
+          $fddZip = "$outRoot/Hammer5Git-v$ver-win-x64-dependent.zip"
+
+          Write-Host ">>> 正在构建框架依赖版..." -ForegroundColor Cyan
+          dotnet publish $project `
+            -c Release `
+            -r win-x64 `
+            --self-contained false `
+            -p:WindowsAppSDKSelfContained=true `
+            -p:Version=$ver `
+            -p:DebugType=none `
+            -p:DebugSymbols=false `
+            @appxArgs `
+            -o $fddDir
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # 校验并补齐 PRI / XBF 资源
+          if (-not (Test-Path "$fddDir/Hammer5Git.pri") -and (Test-Path "dist/Hammer5Git.pri")) {
+            Copy-Item "dist/Hammer5Git.pri" $fddDir -Force
+          }
+          Get-ChildItem -Path "dist" -Filter "*.xbf" -ErrorAction SilentlyContinue | ForEach-Object {
+            if (-not (Test-Path "$fddDir/$($_.Name)")) {
+              Copy-Item $_.FullName $fddDir -Force
+            }
+          }
+
+          # 剔除未使用的组件
+          Prune-UnusedArtifacts -dir $fddDir -isSelfContained $false
+
+          Write-Host ">>> 压缩框架依赖版为 Zip..." -ForegroundColor Cyan
+          Compress-Archive -Path "$fddDir/*" -DestinationPath $fddZip -CompressionLevel Optimal
+
+          # ----------------------------------------------------
+          # 3. 生成 SHA256SUMS 校验文件与体积统计
+          # ----------------------------------------------------
+          Write-Host ">>> 生成 SHA256 校验清单..." -ForegroundColor Cyan
+          $checksumFile = "$outRoot/SHA256SUMS.txt"
+          $lines = @()
+          Get-ChildItem -Path $outRoot -Filter "*.zip" | ForEach-Object {
+            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower()
+            $lines += "$hash  $($_.Name)"
+            $sizeMb = [math]::Round($_.Length / 1MB, 2)
+            Write-Host "产物: $($_.Name) ($sizeMb MB)" -ForegroundColor Green
+          }
+          Set-Content -Path $checksumFile -Value ($lines -join "`n") -Encoding utf8
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hammer5Git-Packages-${{ steps.version.outputs.version }}
+          path: |
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, 'alpha') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'rc') }}

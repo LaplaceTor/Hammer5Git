@@ -1,0 +1,32 @@
+# 构建输出
+bin/
+obj/
+dist/
+artifacts/
+artifacts-ci/
+*.zip
+
+# 构建中间物
+*.cache
+*.pdb
+*.mui
+*.winmd
+*.vsmart
+
+# 用户本地数据
+repos/
+.recovery_backups/
+.corrupted_dumps/
+*.user
+*.tmp
+*.log
+
+# 工具目录
+.workbuddy/
+.vs/
+.gemini/
+
+# 本地打包脚本（不上传 GitHub）
+package.ps1
+package*.ps1
+scripts/

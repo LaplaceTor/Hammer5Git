@@ -1,0 +1,209 @@
+<Project>
+  <UsingTask TaskName="RunManifestToolDirectly" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <ToolPath ParameterType="System.String" Required="true" />
+      <Args ParameterType="System.String" Required="true" />
+      <WorkDir ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.Diagnostics" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var psi = new ProcessStartInfo(ToolPath, Args)
+        {
+            WorkingDirectory = WorkDir,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        using var p = Process.Start(psi);
+        string stdout = p.StandardOutput.ReadToEnd();
+        string stderr = p.StandardError.ReadToEnd();
+        p.WaitForExit();
+        if (!string.IsNullOrWhiteSpace(stdout)) Log.LogMessage(MessageImportance.Normal, stdout);
+        if (p.ExitCode != 0) Log.LogError($"Tool {ToolPath} exited with code {p.ExitCode}: {stderr} {stdout}");
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="MarkupCompilePass1"
+          DependsOnTargets="$(MarkupCompilePass1DependsOn)"
+          Condition="'@(Page)' != '' Or '@(ApplicationDefinition)' != '' ">
+    <MakeDir Condition="'$(ManagedAssembly)'!='false'" Directories="$(XamlGeneratedOutputPath)intermediatexaml\" />
+    <ItemGroup>
+      <ReferencePath Condition="'$(IsNativeLanguage)'=='true' and Exists($(FacadeWinmdPath))" Include="$(FacadeWinmdPath)" />
+    </ItemGroup>
+    <PropertyGroup>
+      <XamlCompilerExeInputJson>$(XamlGeneratedOutputPath)\input.json</XamlCompilerExeInputJson>
+      <XamlCompilerExeOutputJson>$(XamlGeneratedOutputPath)\output.json</XamlCompilerExeOutputJson>
+    </PropertyGroup>
+    <InputSerializer
+        JsonFilePath="$(XamlCompilerExeInputJson)"
+        LanguageSourceExtension="$(DefaultLanguageSourceExtension)"
+        Language="$(XamlLanguage)"
+        RootNamespace="$(RootNamespace)"
+        XamlPages="@(Page)"
+        XamlApplications="@(ApplicationDefinition)"
+        PriIndexName="$(PriIndexName)"
+        ProjectName="$(XamlProjectName)"
+        IsPass1="True"
+        CodeGenerationControlFlags="$(XamlCodeGenerationControlFlags)"
+        ProjectPath="$(MSBuildProjectFullPath)"
+        CIncludeDirectories="$(XamlCppIncludeDirectories)"
+        OutputPath="$(XamlGeneratedOutputPath)"
+        OutputType="$(OutputType)"
+        ReferenceAssemblyPaths="@(ReferenceAssemblyPaths)"
+        ReferenceAssemblies="@(ReferencePath)"
+        ForceSharedStateShutdown="False"
+        CompileMode="RealBuildPass1"
+        XAMLFingerprint="$(XAMLFingerprint)"
+        FingerprintIgnorePaths="$(XAMLFingerprintIgnorePaths)"
+        VCInstallDir="$(VCInstallDir)"
+        SavedStateFile="$(XamlSavedStateFilePath)"
+        SuppressWarnings="$(SuppressXamlWarnings)"
+        TargetPlatformMinVersion="$(TargetPlatformMinVersion)"
+        WindowsSdkPath="$(WindowsSdkPath)"
+        XamlResourceMapName="$(XamlResourceMapName)"
+        XamlComponentResourceLocation="$(XamlComponentResourceLocation)"
+        FeatureControlFlags="@(XamlFeatureControlFlags)"
+        VCInstallPath32="$(VCInstallPath32)"
+        VCInstallPath64="$(VCInstallPath64)"
+        GenXbfPath="$(GenXbfPath)"
+        PrecompiledHeaderFile="$(PrecompiledHeaderFile)" />
+    <RunManifestToolDirectly
+        ToolPath="$(XamlCompilerExePath)"
+        Args="&quot;$(XamlCompilerExeInputJson)&quot; &quot;$(XamlCompilerExeOutputJson)&quot;"
+        WorkDir="$(MSBuildProjectDirectory)" />
+    <OutputDeserializer JsonFilePath="$(XamlCompilerExeOutputJson)">
+      <Output Condition="'$(ManagedAssembly)'!='false'" ItemName="Compile" TaskParameter="GeneratedCodeFiles" />
+      <Output ItemName="FileWrites" TaskParameter="GeneratedCodeFiles" />
+      <Output ItemName="FileWrites" TaskParameter="GeneratedXamlFiles" />
+      <Output ItemName="FileWrites" TaskParameter="GeneratedXbfFiles" />
+      <Output ItemName="_GeneratedCodeFiles" TaskParameter="GeneratedCodeFiles" />
+      <Output ItemName="_GeneratedXamlFiles" TaskParameter="GeneratedXamlFiles" />
+      <Output ItemName="_GeneratedXbfFiles" TaskParameter="GeneratedXbfFiles" />
+    </OutputDeserializer>
+    <ItemGroup>
+      <FileWrites Include="$(XamlSavedStateFilePath)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="MarkupCompilePass2"
+          DependsOnTargets="$(MarkupCompilePass2DependsOn)"
+          Condition="'@(Page)' != '' Or '@(ApplicationDefinition)' != '' ">
+    <PropertyGroup>
+      <LocalAssembly Condition="'$(LocalAssembly)' == '' and Exists(@(XamlIntermediateAssembly))">
+        @(XamlIntermediateAssembly->'%(Identity)')
+      </LocalAssembly>
+      <XamlLocalAssembly Condition="'$(XamlLocalAssembly)' == ''">$(LocalAssembly)</XamlLocalAssembly>
+      <XamlCompilerExeInputJson>$(XamlGeneratedOutputPath)\input.json</XamlCompilerExeInputJson>
+      <XamlCompilerExeOutputJson>$(XamlGeneratedOutputPath)\output.json</XamlCompilerExeOutputJson>
+    </PropertyGroup>
+    <CallTarget Targets="SDKRedistOutputGroup" Condition="'$(IncludeSDKRedistOutputGroup)' == 'true'">
+      <Output TaskParameter="TargetOutputs" ItemName="_SDKRedistOutputGroupOutput_xaml" />
+    </CallTarget>
+    <ItemGroup>
+      <SdkXamlItems Include="@(_SDKRedistOutputGroupOutput_xaml)" Condition="'%(Extension)'=='.xaml'" />
+      <XamlReferencesToCompile Condition="'$(IsNativeLanguage)'=='true'" Include="@(WinMDReferenceToCompile)" />
+      <XamlReferencesToCompile Condition="'$(IsNativeLanguage)'=='true' and Exists($(FacadeWinmdPath))" Include="$(FacadeWinmdPath)" />
+      <XamlReferencesToCompile Condition="'$(IsNativeLanguage)'!='true'" Include="@(ReferencePath)" />
+    </ItemGroup>
+    <InputSerializer
+        JsonFilePath="$(XamlCompilerExeInputJson)"
+        LanguageSourceExtension="$(DefaultLanguageSourceExtension)"
+        Language="$(XamlLanguage)"
+        RootNamespace="$(RootNamespace)"
+        XamlPages="@(Page)"
+        XamlApplications="@(ApplicationDefinition)"
+        SdkXamlPages="@(SdkXamlItems)"
+        PriIndexName="$(PriIndexName)"
+        ProjectName="$(XamlProjectName)"
+        IsPass1="False"
+        DisableXbfGeneration="$(DisableXbfGeneration)"
+        DisableXbfLineInfo="$(DisableXbfLineInfo)"
+        CodeGenerationControlFlags="$(XamlCodeGenerationControlFlags)"
+        ClIncludeFiles="@(ClInclude)"
+        CIncludeDirectories="$(XamlCppIncludeDirectories)"
+        LocalAssembly="$(XamlLocalAssembly)"
+        ProjectPath="$(MSBuildProjectFullPath)"
+        OutputPath="$(XamlGeneratedOutputPath)"
+        OutputType="$(OutputType)"
+        ReferenceAssemblyPaths="@(ReferenceAssemblyPaths)"
+        ReferenceAssemblies="@(XamlReferencesToCompile)"
+        ForceSharedStateShutdown="False"
+        CompileMode="RealBuildPass2"
+        XAMLFingerprint="$(XAMLFingerprint)"
+        FingerprintIgnorePaths="$(XAMLFingerprintIgnorePaths)"
+        VCInstallDir="$(VCInstallDir)"
+        WindowsSdkPath="$(WindowsSdkPath)"
+        SavedStateFile="$(XamlSavedStateFilePath)"
+        RootsLog="$(XamlRootsLog)"
+        SuppressWarnings="$(SuppressXamlWarnings)"
+        TargetPlatformMinVersion="$(TargetPlatformMinVersion)"
+        XamlResourceMapName="$(XamlResourceMapName)"
+        XamlComponentResourceLocation="$(XamlComponentResourceLocation)"
+        FeatureControlFlags="@(XamlFeatureControlFlags)"
+        VCInstallPath32="$(VCInstallPath32)"
+        VCInstallPath64="$(VCInstallPath64)"
+        GenXbfPath="$(GenXbfPath)"
+        PrecompiledHeaderFile="$(PrecompiledHeaderFile)" />
+    <RunManifestToolDirectly
+        ToolPath="$(XamlCompilerExePath)"
+        Args="&quot;$(XamlCompilerExeInputJson)&quot; &quot;$(XamlCompilerExeOutputJson)&quot;"
+        WorkDir="$(MSBuildProjectDirectory)" />
+    <OutputDeserializer JsonFilePath="$(XamlCompilerExeOutputJson)">
+      <Output Condition="'$(ManagedAssembly)'!='false'" ItemName="Compile" TaskParameter="GeneratedCodeFiles" />
+      <Output Condition="'$(ManagedAssembly)'=='false'" ItemName="XamlGFiles" TaskParameter="GeneratedCodeFiles" />
+      <Output ItemName="FileWrites" TaskParameter="GeneratedCodeFiles" />
+      <Output ItemName="FileWrites" TaskParameter="GeneratedXamlFiles" />
+      <Output ItemName="FileWrites" TaskParameter="GeneratedXbfFiles" />
+      <Output ItemName="FileWrites" TaskParameter="GeneratedXamlPagesFiles" />
+      <Output ItemName="_GeneratedCodeFiles" TaskParameter="GeneratedCodeFiles" />
+      <Output ItemName="_GeneratedXamlFiles" TaskParameter="GeneratedXamlFiles" />
+      <Output ItemName="_GeneratedXbfFiles" TaskParameter="GeneratedXbfFiles" />
+      <Output ItemName="GeneratedXamlPagesFiles" TaskParameter="GeneratedXamlPagesFiles" />
+    </OutputDeserializer>
+    <ItemGroup>
+      <FileWrites Include="$(XamlSavedStateFilePath)" />
+      <FileWrites Condition="'$(XamlRootsLog)' != ''" Include="$(XamlRootsLog)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="CreateWinRTRegistration"
+          BeforeTargets="AssignTargetPaths;CoreCompile"
+          DependsOnTargets="GetNewAppManifestValues;ExtractMicrosoftWindowsAppSDKMsixFiles"
+          Inputs="$(UserApplicationManifest);$(WindowsAppSDKAppxManifest)"
+          Outputs="$(ApplicationManifest)"
+          Condition="'$(MSBuildProjectExtension)' != '.wapproj' and '$(WindowsAppSDKSelfContained)' != 'false'">
+    <MakeDir Directories="$(SelfContainedIntermediateOutputPath)Manifests\" />
+    <PropertyGroup>
+      <WindowsAppSDKAppManifest>$(SelfContainedIntermediateOutputPath)Manifests\WindowsAppSDK.manifest</WindowsAppSDKAppManifest>
+      <WindowsAppSDKRedirectDlls>false</WindowsAppSDKRedirectDlls>
+      <WindowsAppSDKRedirectDlls Condition="'$(PublishSingleFile)'=='true'">true</WindowsAppSDKRedirectDlls>
+    </PropertyGroup>
+    <GenerateAppManifestFromAppx
+        RedirectDlls="$(WindowsAppSDKRedirectDlls)"
+        MsixContentDir="$(MicrosoftWindowsAppSDKMsixContent)"
+        InAppxManifest="$(WindowsAppSDKAppxManifest)"
+        OutAppManifest="$(WindowsAppSDKAppManifest)" />
+    <ItemGroup>
+      <MtMergeInputs Include="$(WindowsAppSDKAppManifest)" />
+      <MtMergeInputs Condition="'$(UserApplicationManifest)'!=''" Include="$(UserApplicationManifest)" />
+    </ItemGroup>
+    <RunManifestToolDirectly
+        ToolPath="$(ManifestTool)"
+        Args="-nologo -manifest @(MtMergeInputs->'&quot;%(Identity)&quot;', ' ') -out:&quot;$(ApplicationManifest)&quot;"
+        WorkDir="$(MSBuildProjectDirectory)" />
+    <Touch Files="$(ApplicationManifest)" />
+  </Target>
+
+  <Target Name="CopyPriAndXbfToPublishDir" AfterTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <_AppPriFiles Include="$(OutputPath)$(TargetName).pri;$(OutputPath)*.xbf" />
+      <ResolvedFileToPublish Include="@(_AppPriFiles)" Condition="Exists('%(Identity)')">
+        <RelativePath>%(Filename)%(Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
+</Project>
