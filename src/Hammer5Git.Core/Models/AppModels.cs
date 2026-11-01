@@ -36,8 +36,6 @@ public class AppConfig : ObservableModel
     private int _maxAutoCommits = 1000;
     private bool _minimizeToTrayOnClose = true;
     private string _themeMode = "Dark"; // "Dark", "Light", "Default"
-    private bool _reconcileDiscardedAutoSave = true;
-    private int _autosaveDiscardGraceSeconds = 300;
 
     [JsonIgnore]
     public string Cs2InstallPath
@@ -74,24 +72,6 @@ public class AppConfig : ObservableModel
     {
         get => _themeMode;
         set => SetProperty(ref _themeMode, string.IsNullOrWhiteSpace(value) ? "Dark" : value);
-    }
-
-    /// <summary>
-    /// 是否自动对齐并回退被用户放弃保存的 Hammer 自动保存草稿。
-    /// </summary>
-    public bool ReconcileDiscardedAutoSave
-    {
-        get => _reconcileDiscardedAutoSave;
-        set => SetProperty(ref _reconcileDiscardedAutoSave, value);
-    }
-
-    /// <summary>
-    /// 自动保存草稿判定丢弃的宽限等待时间（秒），范围 [30, 7200]，默认 300 秒。
-    /// </summary>
-    public int AutosaveDiscardGraceSeconds
-    {
-        get => _autosaveDiscardGraceSeconds;
-        set => SetProperty(ref _autosaveDiscardGraceSeconds, Math.Clamp(value, 30, 7200));
     }
 
     public List<AddonProfile> Addons { get; set; } = new();
@@ -255,6 +235,11 @@ public class AddonProfile : ObservableModel
         ? resolved
         : string.Empty;
 
+    [JsonIgnore]
+    public string AutoSaveWorktreePath => string.IsNullOrWhiteSpace(ShadowRepoPath)
+        ? string.Empty
+        : Path.Combine(ShadowRepoPath, ".worktrees", "autosave");
+
     /// <summary>
     /// 从 ContentAddonPath (&lt;CS2&gt;\content\csgo_addons\&lt;name&gt;) 推导
     /// &lt;CS2&gt;\content\_toolsautosave\hammer\csgo_addons\&lt;name&gt;。
@@ -334,10 +319,34 @@ public class CommitRecord
     public string Subject { get; set; } = string.Empty;
     public List<string> Tags { get; set; } = new();
 
-    public bool IsAutoSave => Subject.StartsWith("[AutoSave]", StringComparison.OrdinalIgnoreCase);
+    public string BranchName { get; set; } = "main";
+    public bool IsAutoSave => string.Equals(BranchName, "autosave", StringComparison.OrdinalIgnoreCase)
+        || Subject.StartsWith("[AutoSave]", StringComparison.OrdinalIgnoreCase);
+    public bool IsMainBranch => !IsAutoSave;
+    public string BranchBadgeText => IsAutoSave ? "AUTOSAVE" : "MAIN";
+    public string CleanSubject => StripCommitPrefix(Subject);
     public bool HasTag => Tags.Count > 0;
     public string DisplayTime => Timestamp.ToLocalTime().ToString("MM-dd HH:mm:ss");
     public string TagSummary => Tags.Count > 0 ? string.Join(", ", Tags) : string.Empty;
+
+    public static string StripCommitPrefix(string? subject)
+    {
+        if (string.IsNullOrWhiteSpace(subject))
+            return string.Empty;
+
+        string trimmed = subject.Trim();
+        if (trimmed.StartsWith("[AutoSave]", StringComparison.OrdinalIgnoreCase))
+        {
+            string stripped = trimmed["[AutoSave]".Length..].TrimStart();
+            return string.IsNullOrEmpty(stripped) ? trimmed : stripped;
+        }
+        if (trimmed.StartsWith("[Save]", StringComparison.OrdinalIgnoreCase))
+        {
+            string stripped = trimmed["[Save]".Length..].TrimStart();
+            return string.IsNullOrEmpty(stripped) ? trimmed : stripped;
+        }
+        return trimmed;
+    }
 }
 
 public class ChangedFileEntry
@@ -362,88 +371,4 @@ public class VmapConversionResult
     public string ErrorMessage { get; set; } = string.Empty;
     public string SanitizedKv2Content { get; set; } = string.Empty;
     public int ExitCode { get; set; }
-}
-
-/// <summary>
-/// VMAP 变更来源归属：磁盘正式保存 vs Hammer 自动保存草稿。
-/// </summary>
-public enum VmapSourceProvenance
-{
-    /// <summary>
-    /// 源自用户在磁盘上的正式保存 (content/csgo_addons/...)。
-    /// </summary>
-    FormalDiskSave,
-
-    /// <summary>
-    /// 源自 Hammer 后台生成的自动保存草稿 (_toolsautosave/hammer/...)。
-    /// </summary>
-    HammerAutoSave
-}
-
-/// <summary>
-/// 影子仓库回退至正式存档锚点 (refs/hammer5git/last-formal) 的操作结果状态。
-/// </summary>
-public enum FormalAnchorRollbackResult
-{
-    /// <summary>
-    /// 成功硬重置回退至正式存档锚点，且被丢弃的草稿提交已通过安全 tag 归档。
-    /// </summary>
-    RolledBack,
-
-    /// <summary>
-    /// 当前 HEAD 已与正式存档锚点一致，无需执行回退。
-    /// </summary>
-    AlreadyAligned,
-
-    /// <summary>
-    /// 无法或不应执行 hard reset（例如 HEAD 已推送至远程，或锚点到 HEAD 间存在非纯自动保存的提交），需要前向提交正式文件进行对齐。
-    /// </summary>
-    RequiresForwardReconcile,
-
-    /// <summary>
-    /// 回退操作发生错误或异常失败。
-    /// </summary>
-    Failed
-}
-
-/// <summary>
-/// VMAP 地图来源归属与单调水位线元数据，用于识别并对齐未保存的草稿。
-/// </summary>
-public sealed class VmapProvenanceMetadata
-{
-    /// <summary>
-    /// 最近一次同步到影子仓库的源文件修改时间 (UTC)。
-    /// </summary>
-    public DateTime LastSyncedWriteTimeUtc { get; set; }
-
-    /// <summary>
-    /// 最近一次应用的来源类型（正式文件 vs 自动保存）。
-    /// </summary>
-    public VmapSourceProvenance LastSourceKind { get; set; }
-
-    /// <summary>
-    /// 最近一次应用的源文件完整物理路径。
-    /// </summary>
-    public string LastSourcePath { get; set; } = string.Empty;
-
-    /// <summary>
-    /// 最近一次应用到影子仓库时的挂钟时间 (UTC)。
-    /// </summary>
-    public DateTime LastAppliedWallClockUtc { get; set; }
-
-    /// <summary>
-    /// 最近一次应用时观察到的磁盘正式文件修改时间 (UTC)。
-    /// 用于判定此后用户是否在磁盘上手动保存过。
-    /// </summary>
-    public DateTime FormalDiskBaselineWriteTimeUtc { get; set; }
-
-    /// <summary>
-    /// 最近一次源于正式保存的提交哈希。
-    /// </summary>
-    public string LastFormalCommitHash { get; set; } = string.Empty;
-
-    /// <summary>
-    /// 首次检测到该地图草稿可能被丢弃/遗弃的挂钟时间 (UTC)，用于宽限期倒计时。
-    /// </summary>
-    public DateTime DiscardConditionFirstSeenUtc { get; set; }
 }

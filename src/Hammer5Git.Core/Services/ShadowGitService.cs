@@ -34,6 +34,7 @@ public class ShadowGitService
     [
         ".recovery_backups/",
         ".corrupted_dumps/",
+        ".worktrees/",
         "_bakeresourcecache/",
         "_iconcache/"
     ];
@@ -115,6 +116,7 @@ public class ShadowGitService
         }
 
         await UpdateIgnoreAndLfsRulesInternalAsync(profile, ct);
+        await EnsureAutoSaveWorktreeInitializedInternalAsync(profile, ct);
     }
 
     public Task UpdateIgnoreAndLfsRulesAsync(AddonProfile profile, CancellationToken ct = default)
@@ -173,6 +175,90 @@ public class ShadowGitService
 
         string gitattributesPath = Path.Combine(profile.ShadowRepoPath, ".gitattributes");
         await File.WriteAllTextAsync(gitattributesPath, gitattributes.ToString(), new UTF8Encoding(false), ct);
+    }
+
+    public Task EnsureAutoSaveWorktreeInitializedAsync(AddonProfile profile, CancellationToken ct = default)
+        => WithRepoLockAsync(profile.ShadowRepoPath, ct, () => EnsureAutoSaveWorktreeInitializedInternalAsync(profile, ct));
+
+    internal async Task EnsureAutoSaveWorktreeInitializedInternalAsync(AddonProfile profile, CancellationToken ct)
+    {
+        string worktreePath = profile.AutoSaveWorktreePath;
+        if (string.IsNullOrWhiteSpace(worktreePath))
+            return;
+
+        if (Directory.Exists(worktreePath) && File.Exists(Path.Combine(worktreePath, ".git")))
+        {
+            var check = await RunGitAsync(worktreePath, ["rev-parse", "--is-inside-work-tree"], ct);
+            if (check.ExitCode == 0 && string.Equals(check.StdOut.Trim(), "true", StringComparison.OrdinalIgnoreCase))
+            {
+                Directory.CreateDirectory(Path.Combine(worktreePath, "content", "maps"));
+                string wtGitattributes = Path.Combine(worktreePath, ".gitattributes");
+                if (!File.Exists(wtGitattributes))
+                {
+                    await File.WriteAllTextAsync(wtGitattributes, "*.vmap text eol=lf\n", new UTF8Encoding(false), ct);
+                }
+                string wtGitignore = Path.Combine(worktreePath, ".gitignore");
+                if (!File.Exists(wtGitignore))
+                {
+                    await File.WriteAllTextAsync(wtGitignore, "# Hammer5Git Auto-Generated .gitignore for autosave worktree\n*.tmp\n*.bak\n*_c\n*.log\n", new UTF8Encoding(false), ct);
+                }
+                return;
+            }
+        }
+
+        await RunGitAsync(profile.ShadowRepoPath, ["worktree", "prune"], ct);
+
+        if (Directory.Exists(worktreePath))
+        {
+            try
+            {
+                Directory.Delete(worktreePath, true);
+            }
+            catch
+            {
+                // Best effort cleanup
+            }
+        }
+
+        var localCheck = await RunGitAsync(profile.ShadowRepoPath, ["rev-parse", "--verify", "refs/heads/autosave"], ct);
+        if (localCheck.ExitCode == 0)
+        {
+            await RunGitAsync(profile.ShadowRepoPath, ["worktree", "add", "-f", worktreePath, "autosave"], ct);
+        }
+        else
+        {
+            var remoteCheck = await RunGitAsync(profile.ShadowRepoPath, ["rev-parse", "--verify", "refs/remotes/origin/autosave"], ct);
+            if (remoteCheck.ExitCode == 0)
+            {
+                await RunGitAsync(profile.ShadowRepoPath, ["worktree", "add", "-B", "autosave", worktreePath, "origin/autosave"], ct);
+            }
+            else
+            {
+                var orphanRes = await RunGitAsync(profile.ShadowRepoPath, ["worktree", "add", "--orphan", "-b", "autosave", worktreePath], ct);
+                if (orphanRes.ExitCode != 0)
+                {
+                    await RunGitAsync(profile.ShadowRepoPath, ["worktree", "add", worktreePath, "-b", "temp-autosave-init"], ct);
+                    await RunGitAsync(worktreePath, ["checkout", "--orphan", "autosave"], ct);
+                    await RunGitAsync(worktreePath, ["rm", "-rf", "--ignore-unmatch", "."], ct);
+                    await RunGitAsync(profile.ShadowRepoPath, ["branch", "-D", "temp-autosave-init"], ct);
+                }
+            }
+        }
+
+        if (Directory.Exists(worktreePath))
+        {
+            Directory.CreateDirectory(Path.Combine(worktreePath, "content", "maps"));
+
+            await RunGitAsync(worktreePath, ["config", "core.autocrlf", "false"], ct);
+            await RunGitAsync(worktreePath, ["config", "core.quotepath", "false"], ct);
+
+            string wtGitattributes = Path.Combine(worktreePath, ".gitattributes");
+            await File.WriteAllTextAsync(wtGitattributes, "*.vmap text eol=lf\n", new UTF8Encoding(false), ct);
+
+            string wtGitignore = Path.Combine(worktreePath, ".gitignore");
+            string gitignoreContent = "# Hammer5Git Auto-Generated .gitignore for autosave worktree\n*.tmp\n*.bak\n*_c\n*.log\n";
+            await File.WriteAllTextAsync(wtGitignore, gitignoreContent, new UTF8Encoding(false), ct);
+        }
     }
 
     public bool ShouldTrackFile(
@@ -318,8 +404,62 @@ public class ShadowGitService
                 await EnforceRollingHistoryLimitInternalAsync(profile.ShadowRepoPath, maxAutoCommits, ct);
             }
 
-            var history = await GetCommitHistoryInternalAsync(profile.ShadowRepoPath, 1, ct: ct);
-            return history.FirstOrDefault();
+            var history = await ReadBranchCommitHistoryAsync(profile.ShadowRepoPath, "main", 1, null, false, ct);
+            var record = history.FirstOrDefault();
+            if (record != null)
+            {
+                record.BranchName = "main";
+            }
+            return record;
+        });
+    }
+
+    /// <summary>
+    /// Stages all changes in the autosave worktree and commits to the orphan 'autosave' branch if there are diffs.
+    /// Automatically triggers rolling history truncation on the autosave branch if commit count exceeds maxAutoCommits.
+    /// </summary>
+    public Task<CommitRecord?> CommitAutoSaveChangesAsync(
+        AddonProfile profile,
+        string commitMessage,
+        int maxAutoCommits = 500,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(profile.AutoSaveWorktreePath))
+            return Task.FromResult<CommitRecord?>(null);
+
+        return WithRepoLockAsync(profile.ShadowRepoPath, ct, async () =>
+        {
+            await EnsureAutoSaveWorktreeInitializedInternalAsync(profile, ct);
+
+            string wtPath = profile.AutoSaveWorktreePath;
+            if (!Directory.Exists(wtPath))
+                return null;
+
+            await RunGitAsync(wtPath, ["add", "-A"], ct);
+            var status = await RunGitAsync(wtPath, ["status", "--porcelain"], ct);
+            if (string.IsNullOrWhiteSpace(status.StdOut))
+            {
+                return null; // No diff
+            }
+
+            var commitRes = await RunGitAsync(wtPath, ["commit", "-m", commitMessage], ct);
+            if (commitRes.ExitCode != 0)
+            {
+                throw new InvalidOperationException($"Git commit (autosave) 失败: {commitRes.StdErr} {commitRes.StdOut}");
+            }
+
+            if (maxAutoCommits > 0)
+            {
+                await EnforceRollingHistoryLimitInternalAsync(wtPath, maxAutoCommits, ct);
+            }
+
+            var history = await ReadBranchCommitHistoryAsync(profile.ShadowRepoPath, "autosave", 1, null, false, ct);
+            var record = history.FirstOrDefault();
+            if (record != null)
+            {
+                record.BranchName = "autosave";
+            }
+            return record;
         });
     }
 
@@ -336,30 +476,45 @@ public class ShadowGitService
     }
 
     /// <summary>
-    /// Returns all canonical tracked relative paths inside the shadow repository (e.g., "content/maps/arena.vmap", "game/addoninfo.txt").
+    /// Returns all canonical tracked relative paths inside the shadow repository and autosave worktree
+    /// (e.g., "content/maps/arena.vmap", "game/addoninfo.txt").
     /// </summary>
     public List<string> GetShadowTrackedFiles(AddonProfile profile)
     {
-        var files = new List<string>();
-        if (string.IsNullOrWhiteSpace(profile.ShadowRepoPath) || !Directory.Exists(profile.ShadowRepoPath))
-            return files;
-
-        string[] roots = ["content", "game"];
-        foreach (var root in roots)
+        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(profile.ShadowRepoPath) && Directory.Exists(profile.ShadowRepoPath))
         {
-            string subDir = Path.Combine(profile.ShadowRepoPath, root);
-            if (!Directory.Exists(subDir))
-                continue;
-
-            foreach (var file in Directory.EnumerateFiles(subDir, "*.*", SearchOption.AllDirectories))
+            string[] roots = ["content", "game"];
+            foreach (var root in roots)
             {
-                string rel = Path.GetRelativePath(profile.ShadowRepoPath, file).Replace('\\', '/');
-                files.Add(rel);
+                string subDir = Path.Combine(profile.ShadowRepoPath, root);
+                if (!Directory.Exists(subDir))
+                    continue;
+
+                foreach (var file in Directory.EnumerateFiles(subDir, "*.*", SearchOption.AllDirectories))
+                {
+                    string rel = Path.GetRelativePath(profile.ShadowRepoPath, file).Replace('\\', '/');
+                    files.Add(rel);
+                }
             }
         }
 
-        files.Sort(StringComparer.OrdinalIgnoreCase);
-        return files;
+        if (!string.IsNullOrWhiteSpace(profile.AutoSaveWorktreePath) && Directory.Exists(profile.AutoSaveWorktreePath))
+        {
+            string autoContentDir = Path.Combine(profile.AutoSaveWorktreePath, "content");
+            if (Directory.Exists(autoContentDir))
+            {
+                foreach (var file in Directory.EnumerateFiles(autoContentDir, "*.vmap", SearchOption.AllDirectories))
+                {
+                    string rel = Path.GetRelativePath(profile.AutoSaveWorktreePath, file).Replace('\\', '/');
+                    files.Add(rel);
+                }
+            }
+        }
+
+        var result = files.ToList();
+        result.Sort(StringComparer.OrdinalIgnoreCase);
+        return result;
     }
 
     public async Task<List<CommitRecord>> GetCommitHistoryAsync(AddonProfile profile, int maxCount = 500, CancellationToken ct = default)
@@ -369,7 +524,8 @@ public class ShadowGitService
             maxCount,
             filterRepoRelativePath: null,
             hideInitAndMetadataCommits: false,
-            ct);
+            includeAutoSave: true,
+            ct: ct);
     }
 
     public Task<List<CommitRecord>> GetFilteredCommitHistoryAsync(
@@ -377,18 +533,44 @@ public class ShadowGitService
         int maxCount = 500,
         string? filterRepoRelativePath = null,
         bool hideInitAndMetadataCommits = true,
+        bool includeAutoSave = true,
         CancellationToken ct = default)
     {
         if (!Directory.Exists(Path.Combine(profile.ShadowRepoPath, ".git")))
             return Task.FromResult(new List<CommitRecord>());
 
-        return WithRepoLockAsync(profile.ShadowRepoPath, ct, () =>
-            GetCommitHistoryInternalAsync(
+        return WithRepoLockAsync(profile.ShadowRepoPath, ct, async () =>
+        {
+            var mainCommits = await ReadBranchCommitHistoryAsync(
                 profile.ShadowRepoPath,
+                "main",
                 maxCount,
                 filterRepoRelativePath,
                 hideInitAndMetadataCommits,
-                ct));
+                ct);
+
+            List<CommitRecord> autoCommits = [];
+            if (includeAutoSave)
+            {
+                autoCommits = await ReadBranchCommitHistoryAsync(
+                    profile.ShadowRepoPath,
+                    "autosave",
+                    maxCount,
+                    filterRepoRelativePath,
+                    hideInitAndMetadataCommits,
+                    ct);
+            }
+            else
+            {
+                mainCommits = mainCommits.Where(c => !c.IsAutoSave).ToList();
+            }
+
+            return mainCommits
+                .Concat(autoCommits)
+                .OrderByDescending(c => c.Timestamp)
+                .Take(maxCount)
+                .ToList();
+        });
     }
 
     public static bool IsInitOrMetadataCommitSubject(string? subject)
@@ -401,15 +583,20 @@ public class ShadowGitService
                subject.Contains("更新地图属性/全局配置", StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task<List<CommitRecord>> GetCommitHistoryInternalAsync(
+    private async Task<List<CommitRecord>> ReadBranchCommitHistoryAsync(
         string repoPath,
+        string branchOrRef,
         int maxCount,
         string? filterRepoRelativePath = null,
         bool hideInitAndMetadataCommits = false,
         CancellationToken ct = default)
     {
         var records = new List<CommitRecord>();
-        var args = new List<string> { "log", "-n", maxCount.ToString(), "--date=iso-strict", "--format=%H|%h|%ad|%D|%s" };
+        var checkBranch = await RunGitAsync(repoPath, ["rev-parse", "--verify", branchOrRef], ct);
+        if (checkBranch.ExitCode != 0 || string.IsNullOrWhiteSpace(checkBranch.StdOut))
+            return records;
+
+        var args = new List<string> { "log", branchOrRef, "-n", maxCount.ToString(), "--date=iso-strict", "--format=%H|%h|%ad|%D|%s" };
         if (!string.IsNullOrWhiteSpace(filterRepoRelativePath))
         {
             args.Add("--");
@@ -450,7 +637,8 @@ public class ShadowGitService
                 ShortHash = parts[1],
                 Timestamp = dto,
                 Tags = tags,
-                Subject = subject
+                Subject = subject,
+                BranchName = branchOrRef
             });
         }
 
@@ -668,13 +856,18 @@ public class ShadowGitService
 
         string newRootHash = commitTreeRes.StdOut.Trim();
 
-        // Remove old replace refs so they don't accumulate indefinitely
+        // Remove old replace refs that belong to this branch so they don't accumulate indefinitely
         var existingReplaces = await RunGitAsync(repoPath, ["replace", "-l"], ct);
         if (existingReplaces.ExitCode == 0 && !string.IsNullOrWhiteSpace(existingReplaces.StdOut))
         {
             foreach (var oldRef in existingReplaces.StdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
             {
-                await RunGitAsync(repoPath, ["replace", "-d", oldRef.Trim()], ct);
+                string cleanRef = oldRef.Trim();
+                var isAncestor = await RunGitAsync(repoPath, ["merge-base", "--is-ancestor", cleanRef, "HEAD"], ct);
+                if (isAncestor.ExitCode == 0)
+                {
+                    await RunGitAsync(repoPath, ["replace", "-d", cleanRef], ct);
+                }
             }
         }
 
@@ -688,6 +881,12 @@ public class ShadowGitService
 
         return await WithRepoLockAsync(profile.ShadowRepoPath, ct, async () =>
         {
+            var checkMain = await RunGitAsync(profile.ShadowRepoPath, ["rev-parse", "--verify", "refs/heads/main"], ct);
+            if (checkMain.ExitCode != 0 || string.IsNullOrWhiteSpace(checkMain.StdOut))
+            {
+                return (false, "main 分支尚未创建任何提交，暂不可推送到远程仓库。");
+            }
+
             var remotes = await RunGitAsync(profile.ShadowRepoPath, ["remote"], ct);
             if (remotes.StdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).Contains("origin"))
             {
@@ -701,182 +900,24 @@ public class ShadowGitService
             var pushRes = await RunGitAsync(profile.ShadowRepoPath, ["push", "-u", "origin", "main", "--tags", "--force-with-lease"], ct);
             if (pushRes.ExitCode != 0)
             {
-                return (false, $"推送至远程失败: {pushRes.StdErr} {pushRes.StdOut}".Trim());
+                return (false, $"推送 main 分支至远程失败: {pushRes.StdErr} {pushRes.StdOut}".Trim());
             }
 
-            return (true, "已成功推送分支与里程碑标签至远程仓库。");
-        });
-    }
-
-    /// <summary>
-    /// 记录最近一次源于正式保存的提交哈希至专用引用 refs/hammer5git/last-formal。
-    /// </summary>
-    public Task UpdateFormalAnchorRefAsync(AddonProfile profile, string commitHash, CancellationToken ct = default)
-    {
-        if (string.IsNullOrWhiteSpace(commitHash))
-            return Task.CompletedTask;
-
-        return WithRepoLockAsync(profile.ShadowRepoPath, ct, async () =>
-        {
-            try
+            bool pushedAutosave = false;
+            var checkAutosave = await RunGitAsync(profile.ShadowRepoPath, ["rev-parse", "--verify", "refs/heads/autosave"], ct);
+            if (checkAutosave.ExitCode == 0 && !string.IsNullOrWhiteSpace(checkAutosave.StdOut))
             {
-                await RunGitAsync(profile.ShadowRepoPath, ["update-ref", "refs/hammer5git/last-formal", commitHash.Trim()], ct);
-            }
-            catch
-            {
-                // 静默忽略失败，best-effort
-            }
-        });
-    }
-
-    /// <summary>
-    /// 获取 refs/hammer5git/last-formal 记录的正式锚点提交哈希。
-    /// </summary>
-    public Task<(bool Success, string CommitHash)> TryGetFormalAnchorCommitAsync(AddonProfile profile, CancellationToken ct = default)
-    {
-        if (!Directory.Exists(Path.Combine(profile.ShadowRepoPath, ".git")))
-            return Task.FromResult((false, string.Empty));
-
-        return WithRepoLockAsync(profile.ShadowRepoPath, ct, () => TryGetFormalAnchorCommitInternalAsync(profile.ShadowRepoPath, ct));
-    }
-
-    private async Task<(bool Success, string CommitHash)> TryGetFormalAnchorCommitInternalAsync(string repoPath, CancellationToken ct)
-    {
-        try
-        {
-            var res = await RunGitAsync(repoPath, ["rev-parse", "--verify", "refs/hammer5git/last-formal"], ct);
-            if (res.ExitCode == 0 && !string.IsNullOrWhiteSpace(res.StdOut))
-            {
-                return (true, res.StdOut.Trim());
-            }
-            return (false, string.Empty);
-        }
-        catch
-        {
-            return (false, string.Empty);
-        }
-    }
-
-    /// <summary>
-    /// 检查当前 HEAD 是否已被推送至远程仓库 origin/main 分支。
-    /// </summary>
-    public Task<bool> IsHeadPushedToRemoteAsync(AddonProfile profile, CancellationToken ct = default)
-    {
-        if (!Directory.Exists(Path.Combine(profile.ShadowRepoPath, ".git")))
-            return Task.FromResult(false);
-
-        return WithRepoLockAsync(profile.ShadowRepoPath, ct, () => IsHeadPushedToRemoteInternalAsync(profile.ShadowRepoPath, ct));
-    }
-
-    private async Task<bool> IsHeadPushedToRemoteInternalAsync(string repoPath, CancellationToken ct)
-    {
-        try
-        {
-            var remotes = await RunGitAsync(repoPath, ["remote"], ct);
-            if (remotes.ExitCode != 0 || !remotes.StdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).Contains("origin"))
-            {
-                return false;
+                var pushAutoRes = await RunGitAsync(profile.ShadowRepoPath, ["push", "-u", "origin", "autosave", "--force-with-lease"], ct);
+                if (pushAutoRes.ExitCode != 0)
+                {
+                    return (false, $"推送 autosave 分支至远程失败: {pushAutoRes.StdErr} {pushAutoRes.StdOut}".Trim());
+                }
+                pushedAutosave = true;
             }
 
-            var refCheck = await RunGitAsync(repoPath, ["rev-parse", "--verify", "origin/main"], ct);
-            if (refCheck.ExitCode != 0)
-            {
-                return false;
-            }
-
-            var mergeBase = await RunGitAsync(repoPath, ["merge-base", "--is-ancestor", "HEAD", "origin/main"], ct);
-            return mergeBase.ExitCode == 0;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// 将影子仓库安全回退至正式存档锚点 refs/hammer5git/last-formal。
-    /// </summary>
-    public Task<(FormalAnchorRollbackResult Result, string Message)> RollbackToFormalAnchorAsync(
-        AddonProfile profile, string mapDisplayName, CancellationToken ct = default)
-    {
-        if (!Directory.Exists(Path.Combine(profile.ShadowRepoPath, ".git")))
-            return Task.FromResult((FormalAnchorRollbackResult.Failed, "影子仓库未初始化"));
-
-        return WithRepoLockAsync(profile.ShadowRepoPath, ct, async () =>
-        {
-            try
-            {
-                var (hasAnchor, anchorHash) = await TryGetFormalAnchorCommitInternalAsync(profile.ShadowRepoPath, ct);
-                if (!hasAnchor || string.IsNullOrWhiteSpace(anchorHash))
-                {
-                    return (FormalAnchorRollbackResult.Failed, "未找到正式存档锚点 (refs/hammer5git/last-formal)");
-                }
-
-                var headRes = await RunGitAsync(profile.ShadowRepoPath, ["rev-parse", "HEAD"], ct);
-                if (headRes.ExitCode != 0 || string.IsNullOrWhiteSpace(headRes.StdOut))
-                {
-                    return (FormalAnchorRollbackResult.Failed, "无法获取当前 HEAD 提交");
-                }
-                string currentHead = headRes.StdOut.Trim();
-
-                if (string.Equals(currentHead, anchorHash, StringComparison.OrdinalIgnoreCase))
-                {
-                    return (FormalAnchorRollbackResult.AlreadyAligned, "当前 HEAD 已与正式存档锚点一致");
-                }
-
-                bool isPushed = await IsHeadPushedToRemoteInternalAsync(profile.ShadowRepoPath, ct);
-                if (isPushed)
-                {
-                    return (FormalAnchorRollbackResult.RequiresForwardReconcile, "当前 HEAD 已推送至远程仓库，不可执行 reset --hard，需要前向对齐提交");
-                }
-
-                // PART2-a: 在执行 reset --hard 之前，验证从 anchorHash 到 HEAD 之间的提交区间是否纯净。
-                // 运行 git rev-list --format=%s <anchorHash>..HEAD
-                // 要求该区间内每一个提交主题都必须以 "[AutoSave]" 开头。
-                // 若区间内存在非 [AutoSave] 提交（如其他地图的正式保存、常规资产变更），绝不可 reset --hard，必须回退至前向对齐。
-                var revListRes = await RunGitAsync(profile.ShadowRepoPath, ["rev-list", "--format=%s", $"{anchorHash}..HEAD"], ct);
-                if (revListRes.ExitCode != 0)
-                {
-                    return (FormalAnchorRollbackResult.Failed, $"检查提交历史纯净度失败: {revListRes.StdErr}".Trim());
-                }
-
-                var lines = revListRes.StdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
-                var subjectLines = lines
-                    .Where(l => !l.StartsWith("commit ", StringComparison.Ordinal))
-                    .Select(l => l.Trim())
-                    .Where(l => l.Length > 0)
-                    .ToList();
-
-                foreach (var subject in subjectLines)
-                {
-                    if (!subject.StartsWith("[AutoSave]", StringComparison.OrdinalIgnoreCase))
-                    {
-                        return (FormalAnchorRollbackResult.RequiresForwardReconcile,
-                            $"提交历史区间包含非自动保存草稿的提交 ({subject})，为防止误丢弃其他资产或正式存档，转为前向对齐");
-                    }
-                }
-
-                string rawTagName = $"abandoned_{mapDisplayName}_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
-                string cleanTag = new string(rawTagName.Trim().Select(c => char.IsLetterOrDigit(c) || c == '_' || c == '-' || c == '.' ? c : '_').ToArray());
-                if (string.IsNullOrWhiteSpace(cleanTag))
-                {
-                    cleanTag = $"abandoned_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
-                }
-
-                await RunGitAsync(profile.ShadowRepoPath, ["tag", "-f", cleanTag, currentHead], ct);
-
-                var resetRes = await RunGitAsync(profile.ShadowRepoPath, ["reset", "--hard", "refs/hammer5git/last-formal"], ct);
-                if (resetRes.ExitCode != 0)
-                {
-                    return (FormalAnchorRollbackResult.Failed, $"Git reset 失败: {resetRes.StdErr} {resetRes.StdOut}".Trim());
-                }
-
-                return (FormalAnchorRollbackResult.RolledBack, $"已将草稿安全归档至标签 {cleanTag} 并硬重置回退至正式存档 {anchorHash[..Math.Min(7, anchorHash.Length)]}");
-            }
-            catch (Exception ex)
-            {
-                return (FormalAnchorRollbackResult.Failed, $"回退异常: {ex.Message}");
-            }
+            return pushedAutosave
+                ? (true, "已成功推送 main 与 autosave 分支及里程碑标签至远程仓库。")
+                : (true, "已成功推送 main 分支及里程碑标签至远程仓库 (autosave 分支暂无提交)。");
         });
     }
 

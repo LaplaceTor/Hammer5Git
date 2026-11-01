@@ -1,4 +1,4 @@
-﻿<Window
+<Window
     x:Class="Hammer5Git.App.MainWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -304,7 +304,7 @@
                                                    FontWeight="SemiBold"
                                                    FontSize="13"
                                                    TextTrimming="CharacterEllipsis"
-                                                   MaxWidth="195"
+                                                   MaxWidth="130"
                                                    Foreground="{ThemeResource TextFillColorPrimaryBrush}" />
                                         <TextBlock Text="{x:Bind ViewModel.Commits.Count, Mode=OneWay}"
                                                    FontSize="12"
@@ -312,31 +312,42 @@
                                                    VerticalAlignment="Center" />
                                     </StackPanel>
 
-                                    <!-- Milestone Tag Flyout Button -->
-                                    <Button Grid.Column="1"
-                                            Margin="0,0,4,0"
-                                            Padding="8,4"
-                                            Style="{ThemeResource SubtleButtonStyle}"
-                                            IsEnabled="{x:Bind ViewModel.HasSelectedCommit, Mode=OneWay}"
-                                            ToolTipService.ToolTip="添加里程碑标签">
-                                        <StackPanel Orientation="Horizontal" Spacing="5">
-                                            <FontIcon Glyph="&#xE8EC;" FontSize="12" />
-                                            <TextBlock Text="打标签" FontSize="12" />
-                                        </StackPanel>
-                                        <Button.Flyout>
-                                            <Flyout x:Name="AddTagFlyout" Placement="BottomEdgeAlignedRight">
-                                                <StackPanel Width="240" Spacing="8">
-                                                    <TextBox x:Name="TagInputBox"
-                                                             PlaceholderText="输入标签名 (如 v1_alpha)"
-                                                             FontSize="12" />
-                                                    <Button Content="确认打标"
-                                                            HorizontalAlignment="Stretch"
-                                                            Style="{ThemeResource AccentButtonStyle}"
-                                                            Click="OnAddTagClick" />
-                                                </StackPanel>
-                                            </Flyout>
-                                        </Button.Flyout>
-                                    </Button>
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4">
+                                        <!-- AutoSave Filter ToggleButton -->
+                                        <ToggleButton IsChecked="{x:Bind ViewModel.ShowAutoSaveCommits, Mode=TwoWay}"
+                                                      Padding="6,4"
+                                                      ToolTipService.ToolTip="显示/隐藏自动保存草稿提交">
+                                            <StackPanel Orientation="Horizontal" Spacing="4">
+                                                <FontIcon Glyph="&#xE74E;" FontSize="11" />
+                                                <TextBlock Text="自动保存" FontSize="11" />
+                                            </StackPanel>
+                                        </ToggleButton>
+
+                                        <!-- Milestone Tag Flyout Button -->
+                                        <Button Margin="0,0,2,0"
+                                                Padding="6,4"
+                                                Style="{ThemeResource SubtleButtonStyle}"
+                                                IsEnabled="{x:Bind ViewModel.HasSelectedCommit, Mode=OneWay}"
+                                                ToolTipService.ToolTip="添加里程碑标签">
+                                            <StackPanel Orientation="Horizontal" Spacing="4">
+                                                <FontIcon Glyph="&#xE8EC;" FontSize="11" />
+                                                <TextBlock Text="打标签" FontSize="11" />
+                                            </StackPanel>
+                                            <Button.Flyout>
+                                                <Flyout x:Name="AddTagFlyout" Placement="BottomEdgeAlignedRight">
+                                                    <StackPanel Width="240" Spacing="8">
+                                                        <TextBox x:Name="TagInputBox"
+                                                                 PlaceholderText="输入标签名 (如 v1_alpha)"
+                                                                 FontSize="12" />
+                                                        <Button Content="确认打标"
+                                                                HorizontalAlignment="Stretch"
+                                                                Style="{ThemeResource AccentButtonStyle}"
+                                                                Click="OnAddTagClick" />
+                                                    </StackPanel>
+                                                </Flyout>
+                                            </Button.Flyout>
+                                        </Button>
+                                    </StackPanel>
 
                                 </Grid>
 
@@ -347,57 +358,164 @@
                                           SelectionMode="Single">
                                     <ListView.ItemTemplate>
                                         <DataTemplate x:DataType="models:CommitRecord">
-                                            <Border Padding="10,8"
-                                                    Margin="0,3"
-                                                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                                                    BorderThickness="1"
-                                                    CornerRadius="6">
-                                                <StackPanel Spacing="5">
-                                                    <Grid ColumnSpacing="6">
+                                            <Grid Margin="0,3">
+                                                <!-- Main Branch Card -->
+                                                <Border Visibility="{x:Bind IsMainBranch}"
+                                                        Padding="8,8,10,8"
+                                                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                                        BorderThickness="1"
+                                                        CornerRadius="6">
+                                                    <Grid ColumnSpacing="8">
                                                         <Grid.ColumnDefinitions>
-                                                            <ColumnDefinition Width="Auto" />
                                                             <ColumnDefinition Width="Auto" />
                                                             <ColumnDefinition Width="*" />
                                                         </Grid.ColumnDefinitions>
 
+                                                        <!-- Left Accent Bar (Main: Theme Accent Color) -->
                                                         <Border Grid.Column="0"
-                                                                Background="{ThemeResource SubtleFillColorSecondaryBrush}"
-                                                                CornerRadius="4"
-                                                                Padding="6,1">
-                                                            <TextBlock Text="{x:Bind ShortHash}"
-                                                                       FontFamily="Consolas"
-                                                                       FontSize="11"
-                                                                       FontWeight="SemiBold"
-                                                                       Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
-                                                        </Border>
+                                                                Width="3"
+                                                                CornerRadius="1.5"
+                                                                VerticalAlignment="Stretch"
+                                                                Background="{ThemeResource AccentFillColorDefaultBrush}" />
 
-                                                        <Border Grid.Column="1"
-                                                                Visibility="{x:Bind HasTag}"
-                                                                Background="{ThemeResource SystemFillColorCautionBackgroundBrush}"
-                                                                CornerRadius="4"
-                                                                Padding="6,1">
-                                                            <TextBlock Text="{x:Bind TagSummary}"
-                                                                       FontSize="11"
-                                                                       FontWeight="SemiBold"
-                                                                       Foreground="{ThemeResource SystemFillColorCautionBrush}" />
-                                                        </Border>
+                                                        <StackPanel Grid.Column="1" Spacing="5">
+                                                            <Grid ColumnSpacing="6">
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                    <ColumnDefinition Width="*" />
+                                                                </Grid.ColumnDefinitions>
 
-                                                        <TextBlock Grid.Column="2"
-                                                                   Text="{x:Bind DisplayTime}"
-                                                                   FontSize="11"
-                                                                   HorizontalAlignment="Right"
-                                                                   VerticalAlignment="Center"
-                                                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                                                <Border Grid.Column="0"
+                                                                        Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                                                                        CornerRadius="4"
+                                                                        Padding="5,1">
+                                                                    <TextBlock Text="{x:Bind ShortHash}"
+                                                                               FontFamily="Consolas"
+                                                                               FontSize="11"
+                                                                               FontWeight="SemiBold"
+                                                                               Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                                                </Border>
+
+                                                                <Border Grid.Column="1"
+                                                                        Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                                                                        CornerRadius="4"
+                                                                        Padding="5,1">
+                                                                    <TextBlock Text="MAIN"
+                                                                               FontSize="10"
+                                                                               FontWeight="Bold"
+                                                                               Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                                                                </Border>
+
+                                                                <Border Grid.Column="2"
+                                                                        Visibility="{x:Bind HasTag}"
+                                                                        Background="{ThemeResource SystemFillColorCautionBackgroundBrush}"
+                                                                        CornerRadius="4"
+                                                                        Padding="5,1">
+                                                                    <TextBlock Text="{x:Bind TagSummary}"
+                                                                               FontSize="11"
+                                                                               FontWeight="SemiBold"
+                                                                               Foreground="{ThemeResource SystemFillColorCautionBrush}" />
+                                                                </Border>
+
+                                                                <TextBlock Grid.Column="3"
+                                                                           Text="{x:Bind DisplayTime}"
+                                                                           FontSize="11"
+                                                                           HorizontalAlignment="Right"
+                                                                           VerticalAlignment="Center"
+                                                                           Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                                            </Grid>
+
+                                                            <TextBlock Text="{x:Bind CleanSubject}"
+                                                                       FontSize="12"
+                                                                       FontWeight="SemiBold"
+                                                                       TextWrapping="Wrap"
+                                                                       MaxLines="2"
+                                                                       Foreground="{ThemeResource TextFillColorPrimaryBrush}" />
+                                                        </StackPanel>
                                                     </Grid>
+                                                </Border>
 
-                                                    <TextBlock Text="{x:Bind Subject}"
-                                                               FontSize="12"
-                                                               TextWrapping="Wrap"
-                                                               MaxLines="2"
-                                                               Foreground="{ThemeResource TextFillColorPrimaryBrush}" />
-                                                </StackPanel>
-                                            </Border>
+                                                <!-- AutoSave Branch Card -->
+                                                <Border Visibility="{x:Bind IsAutoSave}"
+                                                        Padding="8,8,10,8"
+                                                        Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                                                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                                        BorderThickness="1"
+                                                        CornerRadius="6">
+                                                    <Grid ColumnSpacing="8">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="Auto" />
+                                                            <ColumnDefinition Width="*" />
+                                                        </Grid.ColumnDefinitions>
+
+                                                        <!-- Left Accent Bar (AutoSave: Amber/Caution Color) -->
+                                                        <Border Grid.Column="0"
+                                                                Width="3"
+                                                                CornerRadius="1.5"
+                                                                VerticalAlignment="Stretch"
+                                                                Background="{ThemeResource SystemFillColorCautionBrush}" />
+
+                                                        <StackPanel Grid.Column="1" Spacing="5">
+                                                            <Grid ColumnSpacing="6">
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                    <ColumnDefinition Width="*" />
+                                                                </Grid.ColumnDefinitions>
+
+                                                                <Border Grid.Column="0"
+                                                                        Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                                                                        CornerRadius="4"
+                                                                        Padding="5,1">
+                                                                    <TextBlock Text="{x:Bind ShortHash}"
+                                                                               FontFamily="Consolas"
+                                                                               FontSize="11"
+                                                                               FontWeight="SemiBold"
+                                                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                                </Border>
+
+                                                                <Border Grid.Column="1"
+                                                                        Background="{ThemeResource SystemFillColorCautionBackgroundBrush}"
+                                                                        CornerRadius="4"
+                                                                        Padding="5,1">
+                                                                    <TextBlock Text="AUTOSAVE"
+                                                                               FontSize="10"
+                                                                               FontWeight="Bold"
+                                                                               Foreground="{ThemeResource SystemFillColorCautionBrush}" />
+                                                                </Border>
+
+                                                                <Border Grid.Column="2"
+                                                                        Visibility="{x:Bind HasTag}"
+                                                                        Background="{ThemeResource SystemFillColorCautionBackgroundBrush}"
+                                                                        CornerRadius="4"
+                                                                        Padding="5,1">
+                                                                    <TextBlock Text="{x:Bind TagSummary}"
+                                                                               FontSize="11"
+                                                                               FontWeight="SemiBold"
+                                                                               Foreground="{ThemeResource SystemFillColorCautionBrush}" />
+                                                                </Border>
+
+                                                                <TextBlock Grid.Column="3"
+                                                                           Text="{x:Bind DisplayTime}"
+                                                                           FontSize="11"
+                                                                           HorizontalAlignment="Right"
+                                                                           VerticalAlignment="Center"
+                                                                           Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                                            </Grid>
+
+                                                            <TextBlock Text="{x:Bind CleanSubject}"
+                                                                       FontSize="12"
+                                                                       TextWrapping="Wrap"
+                                                                       MaxLines="2"
+                                                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </Border>
+                                            </Grid>
                                         </DataTemplate>
                                     </ListView.ItemTemplate>
                                 </ListView>

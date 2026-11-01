@@ -212,6 +212,19 @@ public sealed class MainViewModel : ObservableModel, IDisposable
         ? "提交历史"
         : Path.GetFileName(_activeFilterFilePath);
 
+    private bool _showAutoSaveCommits = true;
+    public bool ShowAutoSaveCommits
+    {
+        get => _showAutoSaveCommits;
+        set
+        {
+            if (SetProperty(ref _showAutoSaveCommits, value))
+            {
+                _ = LoadCommitHistoryForSelectedAddonAsync();
+            }
+        }
+    }
+
     private CommitRecord? _selectedCommit;
     public CommitRecord? SelectedCommit
     {
@@ -704,7 +717,8 @@ public sealed class MainViewModel : ObservableModel, IDisposable
                 addon,
                 Config.MaxAutoCommits,
                 filterRepoRelativePath: filterPath,
-                hideInitAndMetadataCommits: true);
+                hideInitAndMetadataCommits: true,
+                includeAutoSave: ShowAutoSaveCommits);
 
             if (SelectedAddon != addon)
                 return;

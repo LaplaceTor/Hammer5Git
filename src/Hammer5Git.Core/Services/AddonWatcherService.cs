@@ -23,8 +23,8 @@ public class AddonWatcherService : IDisposable
     private readonly Dictionary<string, AddonWatchSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _suppressedPaths = new(StringComparer.OrdinalIgnoreCase);
 
-    // Key: "{addonName}|{canonicalRelPath}" (OrdinalIgnoreCase), Value: 已同步源文件的元数据与单调水位线
-    private readonly ConcurrentDictionary<string, VmapProvenanceMetadata> _provenanceStore = new(StringComparer.OrdinalIgnoreCase);
+    // Key: "{addonName}|{canonicalRelPath}" (OrdinalIgnoreCase), Value: 已同步至 autosave 分支的源文件最新 LastWriteTimeUtc
+    private readonly ConcurrentDictionary<string, DateTime> _autoSaveWatermarks = new(StringComparer.OrdinalIgnoreCase);
 
     private static string GetWatermarkKey(string addonName, string canonicalRelPath)
         => $"{addonName.Trim()}|{canonicalRelPath.Replace('\\', '/').TrimStart('/')}";
@@ -33,104 +33,47 @@ public class AddonWatcherService : IDisposable
     private static readonly TimeSpan FutureClockSkewThreshold = TimeSpan.FromMinutes(2);
 
     /// <summary>
-    /// 判断候选 VMAP 文件是否满足水位线准入条件（严格无副作用判定）。
+    /// 判断候选 AutoSave 草稿是否满足单调递增水位线准入条件。
     /// </summary>
-    public bool ShouldAcceptCandidateByWatermark(
-        string addonName,
-        string canonicalRelPath,
-        DateTime candidateWriteTimeUtc,
-        VmapSourceProvenance provenance)
-    {
-        // DEF-03 修复：如果是磁盘正式保存 (FormalDiskSave)，永远放行。
-        // 水位线设计的初衷是压制重复滞后的自动保存草稿事件，绝对不能阻拦作为真实数据源 (Single Source of Truth) 的正式文件。
-        if (provenance == VmapSourceProvenance.FormalDiskSave)
-            return true;
-
-        string key = GetWatermarkKey(addonName, canonicalRelPath);
-        if (!_provenanceStore.TryGetValue(key, out var recorded))
-            return true;
-
-        // DEF-05 修复：时钟回拨保护，纯只读判定，绝不在判定阶段产生副作用修改状态。
-        // 如果已记录的水位线比当前系统 UTC 时间还超前超过 2 分钟，说明发生过时钟回拨，直接放行而不篡改记录。
-        if (recorded.LastSyncedWriteTimeUtc > DateTime.UtcNow.Add(FutureClockSkewThreshold))
-            return true;
-
-        return candidateWriteTimeUtc >= recorded.LastSyncedWriteTimeUtc - WatermarkTolerance;
-    }
-
-    /// <summary>
-    /// 兼容重载（默认按 HammerAutoSave 判定）。
-    /// </summary>
-    public bool ShouldAcceptCandidateByWatermark(
+    public bool ShouldAcceptAutoSaveCandidate(
         string addonName,
         string canonicalRelPath,
         DateTime candidateWriteTimeUtc)
-        => ShouldAcceptCandidateByWatermark(addonName, canonicalRelPath, candidateWriteTimeUtc, VmapSourceProvenance.HammerAutoSave);
-
-    /// <summary>
-    /// 推进 VMAP 地图的水位线与来源归属元数据。
-    /// </summary>
-    public void AdvanceWatermark(
-        string addonName,
-        string canonicalRelPath,
-        VmapSourceProvenance provenance,
-        DateTime sourceWriteTimeUtc,
-        string sourceFullPath,
-        DateTime formalDiskWriteTimeUtc)
     {
         string key = GetWatermarkKey(addonName, canonicalRelPath);
-        _provenanceStore.AddOrUpdate(
-            key,
-            _ => new VmapProvenanceMetadata
-            {
-                LastSyncedWriteTimeUtc = sourceWriteTimeUtc,
-                LastSourceKind = provenance,
-                LastSourcePath = sourceFullPath,
-                LastAppliedWallClockUtc = DateTime.UtcNow,
-                FormalDiskBaselineWriteTimeUtc = provenance == VmapSourceProvenance.FormalDiskSave ? sourceWriteTimeUtc : formalDiskWriteTimeUtc,
-                LastFormalCommitHash = string.Empty,
-                DiscardConditionFirstSeenUtc = default
-            },
-            (_, existing) =>
-            {
-                existing.LastSourceKind = provenance;
-                existing.LastSourcePath = sourceFullPath;
-                existing.LastAppliedWallClockUtc = DateTime.UtcNow;
-                existing.DiscardConditionFirstSeenUtc = default;
+        if (!_autoSaveWatermarks.TryGetValue(key, out var recorded))
+            return true;
 
-                if (provenance == VmapSourceProvenance.FormalDiskSave)
-                {
-                    existing.FormalDiskBaselineWriteTimeUtc = sourceWriteTimeUtc;
-                }
-                else
-                {
-                    existing.FormalDiskBaselineWriteTimeUtc = formalDiskWriteTimeUtc;
-                }
+        if (recorded > DateTime.UtcNow.Add(FutureClockSkewThreshold))
+            return true;
 
-                // 时钟回拨重置：若历史记录超前过多，直接重置为当前源时间戳
-                if (existing.LastSyncedWriteTimeUtc > DateTime.UtcNow.Add(FutureClockSkewThreshold))
-                {
-                    existing.LastSyncedWriteTimeUtc = sourceWriteTimeUtc;
-                }
-                else if (sourceWriteTimeUtc > existing.LastSyncedWriteTimeUtc)
-                {
-                    existing.LastSyncedWriteTimeUtc = sourceWriteTimeUtc;
-                }
-
-                return existing;
-            });
+        return candidateWriteTimeUtc >= recorded - WatermarkTolerance;
     }
 
     /// <summary>
-    /// 兼容重载。
+    /// 推进指定地图在 autosave 分支的最新水位线。
     /// </summary>
-    public void AdvanceWatermark(string addonName, string canonicalRelPath, DateTime candidateWriteTimeUtc)
-        => AdvanceWatermark(addonName, canonicalRelPath, VmapSourceProvenance.HammerAutoSave, candidateWriteTimeUtc, string.Empty, default);
-
-    public void RemoveWatermark(string addonName, string canonicalRelPath)
+    public void AdvanceAutoSaveWatermark(
+        string addonName,
+        string canonicalRelPath,
+        DateTime sourceWriteTimeUtc)
     {
         string key = GetWatermarkKey(addonName, canonicalRelPath);
-        _provenanceStore.TryRemove(key, out _);
+        _autoSaveWatermarks.AddOrUpdate(
+            key,
+            sourceWriteTimeUtc,
+            (_, existing) =>
+            {
+                if (existing > DateTime.UtcNow.Add(FutureClockSkewThreshold))
+                    return sourceWriteTimeUtc;
+                return sourceWriteTimeUtc > existing ? sourceWriteTimeUtc : existing;
+            });
+    }
+
+    public void RemoveAutoSaveWatermark(string addonName, string canonicalRelPath)
+    {
+        string key = GetWatermarkKey(addonName, canonicalRelPath);
+        _autoSaveWatermarks.TryRemove(key, out _);
     }
 
     internal static string DetermineCommitPrefix(bool isInitialBaseline, bool anyAutoSave)
@@ -240,21 +183,10 @@ public class AddonWatcherService : IDisposable
         StopWatching(profile.AddonName);
 
         await _gitService.EnsureInitializedAsync(profile, ct);
-        LoadProvenanceStore(profile);
 
         if (performInitialSync)
         {
             await SyncFullAddonAsync(profile, ct);
-        }
-
-        // 新会话启动时，上一轮编辑会话已必然结束；若存在未保存的孤立 AutoSave 草稿，立即对齐回退
-        try
-        {
-            await ReconcileDiscardedAutosavesAsync(profile, ignoreGracePeriod: true, ct);
-        }
-        catch (Exception ex)
-        {
-            LogMessage?.Invoke(profile.AddonName, $"启动时草稿对齐异常: {ex.Message}");
         }
 
         var session = new AddonWatchSession(this, profile, _config, _gitService);
@@ -266,7 +198,7 @@ public class AddonWatcherService : IDisposable
     }
 
     /// <summary>
-    /// 清理指定 Addon 在内存水位线/溯源记录 (_provenanceStore) 中的所有条目，防止内存泄漏。
+    /// 清理指定 Addon 在内存水位线中的所有条目，防止内存泄漏。
     /// </summary>
     public void ClearProvenanceForAddon(string addonName)
     {
@@ -274,13 +206,13 @@ public class AddonWatcherService : IDisposable
             return;
 
         string prefix = $"{addonName.Trim()}|";
-        var keysToRemove = _provenanceStore.Keys
+        var keysToRemove = _autoSaveWatermarks.Keys
             .Where(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
         foreach (var key in keysToRemove)
         {
-            _provenanceStore.TryRemove(key, out _);
+            _autoSaveWatermarks.TryRemove(key, out _);
         }
     }
 
@@ -308,11 +240,10 @@ public class AddonWatcherService : IDisposable
         await _gitService.EnsureInitializedAsync(profile, ct);
         bool isInitialBaseline = !await _gitService.HasAnyCommitsAsync(profile, ct);
 
-        var changedSummaries = new List<string>();
-        bool anyAutoSave = false;
-        var activeShadowRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var mainChangedSummaries = new List<string>();
+        var activeMainShadowRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // 1. 扫描 ContentAddonPath 下的非 VMAP 文件
+        // 1. 主仓库通道：扫描 ContentAddonPath 下的非 VMAP 文件
         if (Directory.Exists(profile.ContentAddonPath))
         {
             var nonVmapContentFiles = Directory.EnumerateFiles(profile.ContentAddonPath, "*.*", SearchOption.AllDirectories)
@@ -324,61 +255,45 @@ public class AddonWatcherService : IDisposable
                 if (!_gitService.ShouldTrackFile(profile, file, isGameSide: false, out string relInContent))
                     continue;
 
-                activeShadowRelativePaths.Add("content/" + relInContent);
+                activeMainShadowRelativePaths.Add("content/" + relInContent);
 
                 var res = await ProcessSingleFileChangeAsync(profile, file, isGameSide: false, isDeleted: false, ct);
                 if (res.Processed && !string.IsNullOrEmpty(res.SummaryFragment))
                 {
-                    changedSummaries.Add(res.SummaryFragment);
+                    mainChangedSummaries.Add(res.SummaryFragment);
                 }
             }
         }
 
-        // 2. 收集 ContentAddonPath + AutoSaveAddonPath 下所有 VMAP 候选，按 CanonicalRelativePath 分组仲裁
-        var vmapCandidates = CollectAllVmapCandidatesInAddon(profile);
-        foreach (var group in vmapCandidates.GroupBy(c => c.CanonicalRelativePath, StringComparer.OrdinalIgnoreCase))
+        // 2. 主仓库通道：扫描 ContentAddonPath 下的正式 .vmap 文件
+        if (Directory.Exists(profile.ContentAddonPath))
         {
-            activeShadowRelativePaths.Add(group.Key);
+            var formalVmapFiles = Directory.EnumerateFiles(profile.ContentAddonPath, "*.vmap", SearchOption.AllDirectories)
+                .Where(f => !f.Contains("_restored_", StringComparison.OrdinalIgnoreCase));
 
-            // DEF-04 类比修复：若候选组中缺少正式保存候选，尝试直接探测磁盘真实文件并补全，防止仅依赖目录遍历遗漏
-            var candidatesList = group.ToList();
-            if (!candidatesList.Any(c => !c.IsAutoSave))
+            foreach (var file in formalVmapFiles)
             {
-                try
+                if (!_gitService.ShouldTrackFile(profile, file, isGameSide: false, out string relInContent, out bool isFromAutoSaveRoot))
+                    continue;
+
+                if (isFromAutoSaveRoot)
+                    continue;
+
+                var (canonicalRel, isAutoSave) = VmapConverterAndSanitizer.NormalizeVmapRelativePath(relInContent, isFromAutoSaveRoot);
+                if (isAutoSave)
+                    continue;
+
+                activeMainShadowRelativePaths.Add(canonicalRel);
+
+                var res = await ProcessSingleFileChangeAsync(profile, file, isGameSide: false, isDeleted: false, ct);
+                if (res.Processed && !string.IsNullOrEmpty(res.SummaryFragment))
                 {
-                    string formalDiskPath = profile.ResolveDiskFilePath(group.Key);
-                    if (File.Exists(formalDiskPath))
-                    {
-                        candidatesList.Add(new VmapConverterAndSanitizer.VmapSourceCandidate(
-                            formalDiskPath,
-                            group.Key,
-                            IsAutoSave: false,
-                            File.GetLastWriteTimeUtc(formalDiskPath),
-                            SlotNumber: -1));
-                    }
+                    mainChangedSummaries.Add(res.SummaryFragment);
                 }
-                catch
-                {
-                    // 保护磁盘读取异常，避免中断整体同步
-                }
-            }
-
-            var winner = VmapConverterAndSanitizer.SelectNewestVmapCandidate(candidatesList);
-
-            VmapSourceProvenance provenance = winner.IsAutoSave ? VmapSourceProvenance.HammerAutoSave : VmapSourceProvenance.FormalDiskSave;
-            if (!ShouldAcceptCandidateByWatermark(profile.AddonName, winner.CanonicalRelativePath, winner.LastWriteTimeUtc, provenance))
-                continue;
-
-            var res = await ProcessSingleFileChangeAsync(profile, winner.FullSourcePath, isGameSide: false, isDeleted: false, ct);
-            if (res.Processed && !string.IsNullOrEmpty(res.SummaryFragment))
-            {
-                changedSummaries.Add(res.SummaryFragment);
-                if (res.WasAutoSave)
-                    anyAutoSave = true;
             }
         }
 
-        // 3. 扫描 GameAddonPath 配置文件
+        // 3. 主仓库通道：扫描 GameAddonPath 配置文件
         if (profile.TrackGameSideConfigs && Directory.Exists(profile.GameAddonPath))
         {
             var gameFiles = Directory.EnumerateFiles(profile.GameAddonPath, "*.*", SearchOption.AllDirectories);
@@ -387,51 +302,75 @@ public class AddonWatcherService : IDisposable
                 if (!_gitService.ShouldTrackFile(profile, file, isGameSide: true, out string relInGame))
                     continue;
 
-                activeShadowRelativePaths.Add("game/" + relInGame);
+                activeMainShadowRelativePaths.Add("game/" + relInGame);
 
                 var res = await ProcessSingleFileChangeAsync(profile, file, isGameSide: true, isDeleted: false, ct);
                 if (res.Processed && !string.IsNullOrEmpty(res.SummaryFragment))
                 {
-                    changedSummaries.Add(res.SummaryFragment);
+                    mainChangedSummaries.Add(res.SummaryFragment);
                 }
             }
         }
 
-        CleanOrphanedShadowFiles(profile, activeShadowRelativePaths, changedSummaries);
+        CleanOrphanedShadowFiles(profile, activeMainShadowRelativePaths, mainChangedSummaries);
 
-        if (changedSummaries.Count == 0)
+        CommitRecord? mainRecord = null;
+        if (mainChangedSummaries.Count > 0)
+        {
+            string commitPrefix = isInitialBaseline ? "[Init]" : "[Save]";
+            string commitMessage = BuildAggregateCommitMessage(commitPrefix, mainChangedSummaries);
+            mainRecord = await _gitService.CommitPendingChangesAsync(profile, commitMessage, _config.MaxAutoCommits, ct);
+            if (mainRecord != null)
+            {
+                if (isInitialBaseline || ShadowGitService.IsInitOrMetadataCommitSubject(mainRecord.Subject))
+                {
+                    LogMessage?.Invoke(profile.AddonName, $"已建立初始基准快照 [{mainRecord.ShortHash}]");
+                }
+                else
+                {
+                    CommitCreated?.Invoke(profile.AddonName, mainRecord);
+                    LogMessage?.Invoke(profile.AddonName, $"已提交版本 [{mainRecord.ShortHash}]: {mainRecord.Subject}");
+                }
+            }
+        }
+
+        // 4. 自动保存通道 (autosave Worktree)：扫描 AutoSave 目录，按 CanonicalRelativePath 槽位仲裁
+        var autoChangedSummaries = new List<string>();
+        var allVmaps = CollectAllVmapCandidatesInAddon(profile);
+        var autoSaveGroups = allVmaps.Where(c => c.IsAutoSave).GroupBy(c => c.CanonicalRelativePath, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in autoSaveGroups)
+        {
+            var winner = VmapConverterAndSanitizer.SelectNewestVmapCandidate(group);
+            if (!ShouldAcceptAutoSaveCandidate(profile.AddonName, winner.CanonicalRelativePath, winner.LastWriteTimeUtc))
+                continue;
+
+            var res = await ProcessSingleFileChangeAsync(profile, winner.FullSourcePath, isGameSide: false, isDeleted: false, ct);
+            if (res.Processed && !string.IsNullOrEmpty(res.SummaryFragment))
+            {
+                autoChangedSummaries.Add(res.SummaryFragment);
+                AdvanceAutoSaveWatermark(profile.AddonName, winner.CanonicalRelativePath, winner.LastWriteTimeUtc);
+            }
+        }
+
+        CommitRecord? autoRecord = null;
+        if (autoChangedSummaries.Count > 0)
+        {
+            string autoCommitMessage = BuildAggregateCommitMessage("[AutoSave]", autoChangedSummaries);
+            autoRecord = await _gitService.CommitAutoSaveChangesAsync(profile, autoCommitMessage, _config.MaxAutoCommits, ct);
+            if (autoRecord != null)
+            {
+                CommitCreated?.Invoke(profile.AddonName, autoRecord);
+                LogMessage?.Invoke(profile.AddonName, $"已同步自动保存草稿 [{autoRecord.ShortHash}]: {autoRecord.Subject}");
+            }
+        }
+
+        if (mainChangedSummaries.Count > 0 || autoChangedSummaries.Count > 0)
         {
             TrackedFilesChanged?.Invoke(profile.AddonName);
-            return null;
         }
 
-        string commitPrefix = DetermineCommitPrefix(isInitialBaseline, anyAutoSave);
-        string commitMessage = BuildAggregateCommitMessage(commitPrefix, changedSummaries);
-
-        var record = await _gitService.CommitPendingChangesAsync(profile, commitMessage, _config.MaxAutoCommits, ct);
-        TrackedFilesChanged?.Invoke(profile.AddonName);
-
-        if (record != null)
-        {
-            // 当次提交不包含任何 AutoSave 草稿时，说明内容源自正式保存，更新 refs/hammer5git/last-formal 锚点
-            if (!anyAutoSave)
-            {
-                await _gitService.UpdateFormalAnchorRefAsync(profile, record.Hash, ct);
-            }
-
-            SaveProvenanceStore(profile);
-
-            if (isInitialBaseline || ShadowGitService.IsInitOrMetadataCommitSubject(record.Subject))
-            {
-                LogMessage?.Invoke(profile.AddonName, $"已建立初始基准快照 [{record.ShortHash}]");
-            }
-            else
-            {
-                CommitCreated?.Invoke(profile.AddonName, record);
-                LogMessage?.Invoke(profile.AddonName, $"已提交版本 [{record.ShortHash}]: {record.Subject}");
-            }
-        }
-        return record;
+        return mainRecord ?? autoRecord;
     }
 
     private void CleanOrphanedShadowFiles(
@@ -454,7 +393,6 @@ public class AddonWatcherService : IDisposable
                     try
                     {
                         File.Delete(shadowFile);
-                        RemoveWatermark(profile.AddonName, relToRepo);
                         changedSummaries.Add($"清理已删文件 {relToRepo}");
                     }
                     catch
@@ -479,14 +417,22 @@ public class AddonWatcherService : IDisposable
         if (!isGameSide && VmapConverterAndSanitizer.IsVmapRelatedFile(fullSourcePath))
         {
             var (canonicalRelPath, isAutoSave) = VmapConverterAndSanitizer.NormalizeVmapRelativePath(relativeInSource, isFromAutoSaveRoot);
-            string targetShadowFile = Path.Combine(profile.ShadowRepoPath, canonicalRelPath.Replace('/', Path.DirectorySeparatorChar));
+            if (isAutoSave)
+            {
+                await _gitService.EnsureAutoSaveWorktreeInitializedAsync(profile, ct);
+            }
+
+            string baseDir = isAutoSave ? profile.AutoSaveWorktreePath : profile.ShadowRepoPath;
+            if (string.IsNullOrWhiteSpace(baseDir))
+                return (false, isAutoSave, string.Empty);
+
+            string targetShadowFile = Path.Combine(baseDir, canonicalRelPath.Replace('/', Path.DirectorySeparatorChar));
 
             if (isDeleted)
             {
                 if (!isAutoSave && File.Exists(targetShadowFile))
                 {
                     File.Delete(targetShadowFile);
-                    RemoveWatermark(profile.AddonName, canonicalRelPath);
                     return (true, false, $"删除 {canonicalRelPath}");
                 }
                 return (false, isAutoSave, string.Empty);
@@ -497,8 +443,6 @@ public class AddonWatcherService : IDisposable
                 LogMessage?.Invoke(profile.AddonName, $"文件仍被锁定，跳过本次读取: {Path.GetFileName(fullSourcePath)}");
                 return (false, isAutoSave, string.Empty);
             }
-
-            DateTime sourceWriteTimeUtc = File.GetLastWriteTimeUtc(fullSourcePath);
 
             string? previousKv2 = File.Exists(targetShadowFile)
                 ? await File.ReadAllTextAsync(targetShadowFile, Encoding.UTF8, ct)
@@ -539,27 +483,6 @@ public class AddonWatcherService : IDisposable
                     return (false, false, string.Empty);
                 }
             }
-
-            DateTime formalDiskWriteTimeUtc = default;
-            try
-            {
-                string formalDiskPath = profile.ResolveDiskFilePath(canonicalRelPath);
-                if (File.Exists(formalDiskPath))
-                {
-                    formalDiskWriteTimeUtc = File.GetLastWriteTimeUtc(formalDiskPath);
-                }
-            }
-            catch { }
-
-            VmapSourceProvenance provenance = isAutoSave ? VmapSourceProvenance.HammerAutoSave : VmapSourceProvenance.FormalDiskSave;
-            // 文件合法且转换成功，立即推进单调水位线与来源归属（即便后续因无语义差异不产生 Git 提交，也记录该最新状态）
-            AdvanceWatermark(
-                profile.AddonName,
-                canonicalRelPath,
-                provenance,
-                sourceWriteTimeUtc,
-                fullSourcePath,
-                formalDiskWriteTimeUtc);
 
             if (previousKv2 != null && string.Equals(previousKv2, conv.SanitizedKv2Content, StringComparison.Ordinal))
             {
@@ -718,333 +641,6 @@ public class AddonWatcherService : IDisposable
     private void NotifyLogMessage(string addonName, string message) => LogMessage?.Invoke(addonName, message);
     private void NotifyTrackedFilesChanged(string addonName) => TrackedFilesChanged?.Invoke(addonName);
 
-    private static string GetProvenanceFilePath(AddonProfile profile)
-    {
-        return Path.Combine(profile.ShadowRepoPath, ".git", "hammer5git_provenance.json");
-    }
-
-    private void LoadProvenanceStore(AddonProfile profile)
-    {
-        try
-        {
-            string targetPath = GetProvenanceFilePath(profile);
-            if (!File.Exists(targetPath))
-                return;
-
-            string json = File.ReadAllText(targetPath, Encoding.UTF8);
-            var entries = JsonSerializer.Deserialize<Dictionary<string, VmapProvenanceMetadata>>(json);
-            if (entries != null)
-            {
-                foreach (var kvp in entries)
-                {
-                    _provenanceStore[kvp.Key] = kvp.Value;
-                }
-            }
-        }
-        catch
-        {
-            // 静默吞掉所有 IO / JSON 异常
-        }
-    }
-
-    private void SaveProvenanceStore(AddonProfile profile)
-    {
-        try
-        {
-            string gitDir = Path.Combine(profile.ShadowRepoPath, ".git");
-            if (!Directory.Exists(gitDir))
-                return;
-
-            string targetPath = GetProvenanceFilePath(profile);
-            string prefix = $"{profile.AddonName.Trim()}|";
-
-            var addonEntries = _provenanceStore
-                .Where(kvp => kvp.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                .ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.OrdinalIgnoreCase);
-
-            var json = JsonSerializer.Serialize(addonEntries, new JsonSerializerOptions { WriteIndented = true });
-            string tempPath = targetPath + ".tmp";
-            File.WriteAllText(tempPath, json, Encoding.UTF8);
-            File.Move(tempPath, targetPath, overwrite: true);
-        }
-        catch
-        {
-            // 静默吞掉所有 IO / JSON 异常
-        }
-    }
-
-    /// <summary>
-    /// 内容校验兜底：确保影子仓库中指定地图的内容与当前真实磁盘正式保存文件完全一致。
-    /// 若内容存在差异（Ordinal 比较），则写入转换后的 KV2 内容并创建前向对齐提交；若已一致，则不产生空提交。
-    /// </summary>
-    private async Task<(bool Committed, string? ErrorMessage)> EnsureShadowMapMatchesFormalDiskAsync(
-        AddonProfile profile,
-        string canonicalRel,
-        string formalDiskPath,
-        CancellationToken ct)
-    {
-        try
-        {
-            var conv = await _vmapConverter.ConvertAndSanitizeToKv2Async(formalDiskPath, ct);
-            if (!conv.Success)
-            {
-                return (false, $"无法转换正式地图文件: {conv.ErrorMessage}");
-            }
-
-            string targetShadowFile = Path.Combine(profile.ShadowRepoPath, canonicalRel.Replace('/', Path.DirectorySeparatorChar));
-            string? shadowContent = File.Exists(targetShadowFile)
-                ? await File.ReadAllTextAsync(targetShadowFile, Encoding.UTF8, ct)
-                : null;
-
-            // 比较影子仓库目标文件与磁盘真实文件转换后的内容 (Ordinal 比较)
-            if (string.Equals(shadowContent, conv.SanitizedKv2Content, StringComparison.Ordinal))
-            {
-                // 内容已完全一致，无需额外提交
-                return (false, null);
-            }
-
-            string? targetDir = Path.GetDirectoryName(targetShadowFile);
-            if (!string.IsNullOrEmpty(targetDir))
-                Directory.CreateDirectory(targetDir);
-
-            await File.WriteAllTextAsync(targetShadowFile, conv.SanitizedKv2Content, new UTF8Encoding(false), ct);
-
-            string commitSubject = "[Reconcile] 丢弃未保存的自动保存草稿，回退至磁盘正式存档";
-            var commit = await _gitService.CommitPendingChangesAsync(profile, commitSubject, _config.MaxAutoCommits, ct);
-            if (commit != null)
-            {
-                await _gitService.UpdateFormalAnchorRefAsync(profile, commit.Hash, ct);
-                NotifyCommitCreated(profile.AddonName, commit);
-                return (true, null);
-            }
-
-            return (false, null);
-        }
-        catch (Exception ex)
-        {
-            return (false, ex.Message);
-        }
-    }
-
-    /// <summary>
-    /// 检查并对齐被用户丢弃的自动保存草稿（例如在 Hammer 中编辑触发了自动保存，但用户关闭时选择“不保存”）。
-    /// </summary>
-    public async Task<int> ReconcileDiscardedAutosavesAsync(
-        AddonProfile profile,
-        bool ignoreGracePeriod = false,
-        CancellationToken ct = default)
-    {
-        int reconciledCount = 0;
-        try
-        {
-            // 若 Hammer 或 CS2 正在运行，绝不能误判定草稿被废弃
-            if (_envService.IsHammerOrCs2Running(out _))
-            {
-                // 若此前在 Hammer 关闭时曾记录过废弃观测时间，重置为 default 并持久化，
-                // 确保用户重新打开 Hammer 编辑时草稿不会因为此前累计的观测时间而被误杀回滚。
-                bool changed = false;
-                string pfx = $"{profile.AddonName.Trim()}|";
-                foreach (var kvp in _provenanceStore.Where(kvp => kvp.Key.StartsWith(pfx, StringComparison.OrdinalIgnoreCase)))
-                {
-                    if (kvp.Value.DiscardConditionFirstSeenUtc != default)
-                    {
-                        kvp.Value.DiscardConditionFirstSeenUtc = default;
-                        changed = true;
-                    }
-                }
-
-                if (changed)
-                {
-                    SaveProvenanceStore(profile);
-                }
-
-                return 0;
-            }
-
-            string prefix = $"{profile.AddonName.Trim()}|";
-            var matchingEntries = _provenanceStore
-                .Where(kvp => kvp.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                .ToList();
-
-            foreach (var kvp in matchingEntries)
-            {
-                if (ct.IsCancellationRequested)
-                    break;
-
-                string key = kvp.Key;
-                var entry = kvp.Value;
-                string canonicalRel = key[prefix.Length..];
-
-                string formalDiskPath;
-                try
-                {
-                    formalDiskPath = profile.ResolveDiskFilePath(canonicalRel);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (!File.Exists(formalDiskPath))
-                    continue;
-
-                DateTime formalMtimeUtc;
-                try
-                {
-                    formalMtimeUtc = File.GetLastWriteTimeUtc(formalDiskPath);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                // 判断是否为被丢弃的草稿：当前内容来自 AutoSave，且磁盘正式文件修改时间未晚于基线（1秒容差内），
-                // 说明用户在此后未曾按过保存，Hammer 关闭后草稿已被废弃。
-                // 关键健壮性保护：若 Hammer / CS2 正在运行，绝不能误判定草稿被废弃！
-                bool isHammerRunning = _envService.IsHammerOrCs2Running(out _);
-                bool discarded = !isHammerRunning
-                    && entry.LastSourceKind == VmapSourceProvenance.HammerAutoSave
-                    && formalMtimeUtc <= entry.FormalDiskBaselineWriteTimeUtc.AddSeconds(1);
-
-                if (!discarded)
-                {
-                    // 若用户已手动保存或正式文件已更新，或 Hammer 正在运行，重置首次观测时间
-                    if (entry.DiscardConditionFirstSeenUtc != default)
-                    {
-                        entry.DiscardConditionFirstSeenUtc = default;
-                        SaveProvenanceStore(profile);
-                    }
-                    continue;
-                }
-
-                if (entry.DiscardConditionFirstSeenUtc == default)
-                {
-                    entry.DiscardConditionFirstSeenUtc = DateTime.UtcNow;
-                    SaveProvenanceStore(profile);
-                }
-
-                if (!ignoreGracePeriod)
-                {
-                    int graceSeconds = Math.Clamp(_config.AutosaveDiscardGraceSeconds, 30, 7200);
-                    if (DateTime.UtcNow - entry.DiscardConditionFirstSeenUtc < TimeSpan.FromSeconds(graceSeconds))
-                    {
-                        // 尚在宽限期内，等待用户可能的操作
-                        continue;
-                    }
-                }
-
-                // 到期执行对齐，检查配置是否开启
-                if (!_config.ReconcileDiscardedAutoSave)
-                    continue;
-
-                // 准备执行硬重置前做最终检查：Hammer 绝不能处于运行状态
-                if (_envService.IsHammerOrCs2Running(out _))
-                    return reconciledCount;
-
-                string mapDisplayName = Path.GetFileName(canonicalRel);
-                var (rollbackResult, message) = await _gitService.RollbackToFormalAnchorAsync(profile, mapDisplayName, ct);
-
-                switch (rollbackResult)
-                {
-                    case FormalAnchorRollbackResult.RolledBack:
-                    {
-                        // PART2-b: 硬重置成功后执行内容校验兜底，确保影子仓库文件与真实磁盘文件字节一致
-                        var (committed, err) = await EnsureShadowMapMatchesFormalDiskAsync(profile, canonicalRel, formalDiskPath, ct);
-                        if (err != null)
-                        {
-                            LogMessage?.Invoke(profile.AddonName, $"[对齐失败] 地图 {mapDisplayName} 虽然已硬重置，但内容校验/转换异常: {err}");
-                            break;
-                        }
-
-                        entry.LastSourceKind = VmapSourceProvenance.FormalDiskSave;
-                        entry.LastSyncedWriteTimeUtc = formalMtimeUtc;
-                        entry.FormalDiskBaselineWriteTimeUtc = formalMtimeUtc;
-                        entry.LastAppliedWallClockUtc = DateTime.UtcNow;
-                        entry.DiscardConditionFirstSeenUtc = default;
-                        reconciledCount++;
-                        LogMessage?.Invoke(profile.AddonName, $"[对齐成功] 地图 {mapDisplayName} 草稿已丢弃，已通过 Git 硬重置回退至正式存档: {message}");
-                        break;
-                    }
-
-                    case FormalAnchorRollbackResult.AlreadyAligned:
-                    {
-                        var (committed, err) = await EnsureShadowMapMatchesFormalDiskAsync(profile, canonicalRel, formalDiskPath, ct);
-                        if (err != null)
-                        {
-                            LogMessage?.Invoke(profile.AddonName, $"[对齐失败] 无法转换正式地图文件 {formalDiskPath}: {err}");
-                        }
-                        else if (committed)
-                        {
-                            entry.LastSourceKind = VmapSourceProvenance.FormalDiskSave;
-                            entry.LastSyncedWriteTimeUtc = formalMtimeUtc;
-                            entry.FormalDiskBaselineWriteTimeUtc = formalMtimeUtc;
-                            entry.LastAppliedWallClockUtc = DateTime.UtcNow;
-                            entry.DiscardConditionFirstSeenUtc = default;
-                            reconciledCount++;
-                            LogMessage?.Invoke(profile.AddonName, $"[前向对齐成功] 地图 {mapDisplayName} HEAD 虽与锚点一致但地图内容存在差异，已前向提交正式存档快照");
-                        }
-                        else
-                        {
-                            // 影子仓库与磁盘文件已完全一致，不产生空提交，亦不虚报对齐
-                            entry.LastSourceKind = VmapSourceProvenance.FormalDiskSave;
-                            entry.LastSyncedWriteTimeUtc = formalMtimeUtc;
-                            entry.FormalDiskBaselineWriteTimeUtc = formalMtimeUtc;
-                            entry.LastAppliedWallClockUtc = DateTime.UtcNow;
-                            entry.DiscardConditionFirstSeenUtc = default;
-                            LogMessage?.Invoke(profile.AddonName, $"[跳过对齐] 地图 {mapDisplayName} 影子仓库内容已与磁盘正式文件一致，无需额外提交");
-                        }
-                        break;
-                    }
-
-                    // WHY: 即使 RollbackToFormalAnchorAsync 返回 Failed（最常见原因是首次接入 addon 时最新修改为 AutoSave，
-                    // 导致未曾生成 refs/hammer5git/last-formal 锚点引用），该状态亦属正常初始业务场景而非致命异常。
-                    // 前向对齐路径（EnsureShadowMapMatchesFormalDiskAsync）直接将真实磁盘文件转换并覆盖写入影子仓库，
-                    // 完全独立且不依赖任何 Git 引用或历史锚点。因此 Failed 分支绝不能直接跳过，而必须同 RequiresForwardReconcile
-                    // 一样执行前向对齐校验。
-                    case FormalAnchorRollbackResult.RequiresForwardReconcile:
-                    case FormalAnchorRollbackResult.Failed:
-                    default:
-                    {
-                        var (committed, err) = await EnsureShadowMapMatchesFormalDiskAsync(profile, canonicalRel, formalDiskPath, ct);
-                        if (err != null)
-                        {
-                            LogMessage?.Invoke(profile.AddonName, $"[对齐失败] 无法转换正式地图文件 {formalDiskPath}: {err}");
-                        }
-                        else if (committed)
-                        {
-                            entry.LastSourceKind = VmapSourceProvenance.FormalDiskSave;
-                            entry.LastSyncedWriteTimeUtc = formalMtimeUtc;
-                            entry.FormalDiskBaselineWriteTimeUtc = formalMtimeUtc;
-                            entry.LastAppliedWallClockUtc = DateTime.UtcNow;
-                            entry.DiscardConditionFirstSeenUtc = default;
-                            reconciledCount++;
-                            LogMessage?.Invoke(profile.AddonName, $"[前向对齐成功] 地图 {mapDisplayName} 草稿已丢弃，已前向提交正式存档快照至仓库 ({message})");
-                        }
-                        else
-                        {
-                            // 影子仓库与磁盘文件已完全一致，不产生空提交，亦不虚报对齐
-                            entry.LastSourceKind = VmapSourceProvenance.FormalDiskSave;
-                            entry.LastSyncedWriteTimeUtc = formalMtimeUtc;
-                            entry.FormalDiskBaselineWriteTimeUtc = formalMtimeUtc;
-                            entry.LastAppliedWallClockUtc = DateTime.UtcNow;
-                            entry.DiscardConditionFirstSeenUtc = default;
-                            LogMessage?.Invoke(profile.AddonName, $"[跳过对齐] 地图 {mapDisplayName} 影子仓库内容已与磁盘正式文件一致，无需额外提交");
-                        }
-                        break;
-                    }
-                }
-            }
-
-            SaveProvenanceStore(profile);
-        }
-        catch (Exception ex)
-        {
-            LogMessage?.Invoke(profile.AddonName, $"草稿对齐异常: {ex.Message}");
-        }
-
-        return reconciledCount;
-    }
-
     public void Dispose()
     {
         Dispose(true);
@@ -1063,7 +659,7 @@ public class AddonWatcherService : IDisposable
                 s.Dispose();
             }
             _sessions.Clear();
-            _provenanceStore.Clear();
+            _autoSaveWatermarks.Clear();
             _suppressedPaths.Clear();
         }
 
@@ -1083,8 +679,6 @@ public class AddonWatcherService : IDisposable
         private FileSystemWatcher? _autoSaveBootstrapWatcher;
         private readonly object _watcherSync = new();
         private Timer? _debounceTimer;
-        private Timer? _reconcileTimer;
-        private readonly ConcurrentDictionary<string, int> _deferralCounts = new(StringComparer.OrdinalIgnoreCase);
         private readonly SemaphoreSlim _flushLock = new(1, 1);
         private readonly CancellationTokenSource _cts = new();
         private bool _disposed;
@@ -1104,7 +698,6 @@ public class AddonWatcherService : IDisposable
         public void Start()
         {
             _debounceTimer = new Timer(OnDebounceTimerElapsed, null, Timeout.Infinite, Timeout.Infinite);
-            _reconcileTimer = new Timer(OnReconcileTimerElapsed, null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
 
             if (Directory.Exists(Profile.ContentAddonPath))
             {
@@ -1272,21 +865,6 @@ public class AddonWatcherService : IDisposable
             }
         }
 
-        private void OnReconcileTimerElapsed(object? state)
-        {
-            try
-            {
-                if (_disposed || _cts.IsCancellationRequested)
-                    return;
-
-                _ = _parent.ReconcileDiscardedAutosavesAsync(Profile, ignoreGracePeriod: false, _cts.Token);
-            }
-            catch
-            {
-                // 绝不让任何异常逃逸至线程池
-            }
-        }
-
         private async Task FlushPendingChangesAsync()
         {
             if (_pendingChanges.IsEmpty || _cts.IsCancellationRequested || _disposed)
@@ -1317,11 +895,12 @@ public class AddonWatcherService : IDisposable
                 }
 
                 bool isInitialBaseline = !await _gitService.HasAnyCommitsAsync(Profile, _cts.Token);
-                var summaries = new List<string>();
-                bool anyAutoSave = false;
+                var mainSummaries = new List<string>();
+                var autoSummaries = new List<string>();
 
-                var vmapUpsertCandidates = new List<VmapConverterAndSanitizer.VmapSourceCandidate>();
-                var vmapDeleteItems = new List<string>();
+                var formalVmapUpsertCandidates = new List<VmapConverterAndSanitizer.VmapSourceCandidate>();
+                var formalVmapDeleteItems = new List<string>();
+                var autoSaveCandidates = new List<VmapConverterAndSanitizer.VmapSourceCandidate>();
                 var otherItems = new List<KeyValuePair<string, (bool IsGameSide, bool IsDeleted)>>();
 
                 foreach (var item in snapshot)
@@ -1339,7 +918,7 @@ public class AddonWatcherService : IDisposable
                         if (item.Value.IsDeleted || !File.Exists(item.Key))
                         {
                             if (!isAutoSave)
-                                vmapDeleteItems.Add(item.Key);
+                                formalVmapDeleteItems.Add(item.Key);
                             continue;
                         }
 
@@ -1347,8 +926,15 @@ public class AddonWatcherService : IDisposable
                         {
                             DateTime mtimeUtc = File.GetLastWriteTimeUtc(item.Key);
                             int slot = isAutoSave ? VmapConverterAndSanitizer.ExtractAutoSaveSlotNumber(item.Key) : -1;
-                            vmapUpsertCandidates.Add(new VmapConverterAndSanitizer.VmapSourceCandidate(
-                                item.Key, canonicalRel, isAutoSave, mtimeUtc, slot));
+                            var cand = new VmapConverterAndSanitizer.VmapSourceCandidate(item.Key, canonicalRel, isAutoSave, mtimeUtc, slot);
+                            if (isAutoSave)
+                            {
+                                autoSaveCandidates.Add(cand);
+                            }
+                            else
+                            {
+                                formalVmapUpsertCandidates.Add(cand);
+                            }
                         }
                         catch
                         {
@@ -1361,162 +947,108 @@ public class AddonWatcherService : IDisposable
                     }
                 }
 
-                void DeferGroup(IEnumerable<VmapConverterAndSanitizer.VmapSourceCandidate> groupToDefer)
+                // --- 1. 主仓库通道 (main 分支) ---
+                // 正式 VMAP 更新 (按地图分组取最新)
+                foreach (var group in formalVmapUpsertCandidates.GroupBy(c => c.CanonicalRelativePath, StringComparer.OrdinalIgnoreCase))
                 {
-                    foreach (var cand in groupToDefer)
-                    {
-                        _pendingChanges[cand.FullSourcePath] = (IsGameSide: false, IsDeleted: false);
-                    }
-                    int debounceMs = Math.Clamp(_config.DebounceMilliseconds, 500, 15000);
-                    try
-                    {
-                        _debounceTimer?.Change(debounceMs, Timeout.Infinite);
-                    }
-                    catch (ObjectDisposedException) { }
-                }
-
-                // 1. 按 CanonicalRelativePath 分组仲裁：每张图只取最新 1 个候选调用 1 次 dmxconvert
-                foreach (var group in vmapUpsertCandidates.GroupBy(c => c.CanonicalRelativePath, StringComparer.OrdinalIgnoreCase))
-                {
-                    var candidatesWithFormal = group.ToList();
-                    string? formalDiskPath = null;
-                    try
-                    {
-                        formalDiskPath = Profile.ResolveDiskFilePath(group.Key);
-                    }
-                    catch { }
-
-                    bool isSuppressed = !string.IsNullOrWhiteSpace(formalDiskPath) && _parent.IsPathSuppressed(formalDiskPath);
-
-                    // DEF-01 修复：在恢复文件 (Restore) 时，MainWindow 会调用 SuppressPathEvents 设置 8 秒压制窗口。
-                    // 若在此期间 debounce 触发，旧逻辑会因 IsPathSuppressed 为 true 而直接不把正式文件加入候选列表，
-                    // 导致候选列表降级为仅包含旧 autosave 草稿，从而使得旧草稿覆盖较新的正式恢复文件。
-                    // 此处改为延期 (Defer) 整个候选组：重新将事件推回 _pendingChanges 并重启 debounce 计时器。
-                    // 计数器最多允许重试 12 次，超时后自动放行，杜绝死锁。
-                    if (isSuppressed)
-                    {
-                        int attempts = _deferralCounts.AddOrUpdate(group.Key, 1, (_, c) => c + 1);
-                        if (attempts <= 12)
-                        {
-                            DeferGroup(group);
-                            continue;
-                        }
-                        _deferralCounts.TryRemove(group.Key, out _);
-                    }
-                    else
-                    {
-                        _deferralCounts.TryRemove(group.Key, out _);
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(formalDiskPath) &&
-                        File.Exists(formalDiskPath) &&
-                        !candidatesWithFormal.Any(c => string.Equals(c.FullSourcePath, formalDiskPath, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        try
-                        {
-                            candidatesWithFormal.Add(new VmapConverterAndSanitizer.VmapSourceCandidate(
-                                formalDiskPath, group.Key, IsAutoSave: false, File.GetLastWriteTimeUtc(formalDiskPath), SlotNumber: -1));
-                        }
-                        catch { }
-                    }
-
-                    var winner = VmapConverterAndSanitizer.SelectNewestVmapCandidate(candidatesWithFormal);
-
-                    VmapSourceProvenance provenance = winner.IsAutoSave ? VmapSourceProvenance.HammerAutoSave : VmapSourceProvenance.FormalDiskSave;
-                    if (!_parent.ShouldAcceptCandidateByWatermark(Profile.AddonName, winner.CanonicalRelativePath, winner.LastWriteTimeUtc, provenance))
-                    {
-                        continue;
-                    }
-
-                    var res = await _parent.ProcessSingleFileChangeAsync(
-                        Profile, winner.FullSourcePath, isGameSide: false, isDeleted: false, _cts.Token);
-
+                    var winner = group.OrderByDescending(c => c.LastWriteTimeUtc).First();
+                    var res = await _parent.ProcessSingleFileChangeAsync(Profile, winner.FullSourcePath, isGameSide: false, isDeleted: false, _cts.Token);
                     if (res.Processed && !string.IsNullOrEmpty(res.SummaryFragment))
                     {
-                        summaries.Add(res.SummaryFragment);
-                        if (res.WasAutoSave)
-                            anyAutoSave = true;
+                        mainSummaries.Add(res.SummaryFragment);
                     }
                 }
 
-                // 2. 处理正式 VMAP 删除事件（仅当本批次没有同图的有效更新且磁盘上确实已删除）
-                var updatedCanonicalPaths = new HashSet<string>(
-                    vmapUpsertCandidates.Select(c => c.CanonicalRelativePath),
-                    StringComparer.OrdinalIgnoreCase);
-
-                foreach (var delPath in vmapDeleteItems)
+                // 正式 VMAP 删除
+                var updatedCanonicalFormal = new HashSet<string>(formalVmapUpsertCandidates.Select(c => c.CanonicalRelativePath), StringComparer.OrdinalIgnoreCase);
+                foreach (var delPath in formalVmapDeleteItems)
                 {
                     if (_gitService.ShouldTrackFile(Profile, delPath, isGameSide: false, out string rel, out bool fromAutoSave))
                     {
                         var (canonicalRel, _) = VmapConverterAndSanitizer.NormalizeVmapRelativePath(rel, fromAutoSave);
-                        if (updatedCanonicalPaths.Contains(canonicalRel))
+                        if (updatedCanonicalFormal.Contains(canonicalRel))
                             continue;
                     }
 
-                    var res = await _parent.ProcessSingleFileChangeAsync(
-                        Profile, delPath, isGameSide: false, isDeleted: true, _cts.Token);
+                    var res = await _parent.ProcessSingleFileChangeAsync(Profile, delPath, isGameSide: false, isDeleted: true, _cts.Token);
                     if (res.Processed && !string.IsNullOrEmpty(res.SummaryFragment))
                     {
-                        summaries.Add(res.SummaryFragment);
+                        mainSummaries.Add(res.SummaryFragment);
                     }
                 }
 
-                // 3. 处理非 VMAP 文件变更
+                // 其他常规资产 / 配置文件
                 foreach (var item in otherItems)
                 {
-                    var res = await _parent.ProcessSingleFileChangeAsync(
-                        Profile, item.Key, item.Value.IsGameSide, item.Value.IsDeleted, _cts.Token);
+                    var res = await _parent.ProcessSingleFileChangeAsync(Profile, item.Key, item.Value.IsGameSide, item.Value.IsDeleted, _cts.Token);
                     if (res.Processed && !string.IsNullOrEmpty(res.SummaryFragment))
                     {
-                        summaries.Add(res.SummaryFragment);
+                        mainSummaries.Add(res.SummaryFragment);
                     }
                 }
 
-                if (summaries.Count > 0)
+                if (mainSummaries.Count > 0)
                 {
-                    string prefix = DetermineCommitPrefix(isInitialBaseline, anyAutoSave);
-                    string msg = BuildAggregateCommitMessage(prefix, summaries);
+                    string prefix = isInitialBaseline ? "[Init]" : "[Save]";
+                    string msg = BuildAggregateCommitMessage(prefix, mainSummaries);
                     var commit = await _gitService.CommitPendingChangesAsync(Profile, msg, _config.MaxAutoCommits, _cts.Token);
-                    _parent.NotifyTrackedFilesChanged(Profile.AddonName);
-
                     if (commit != null)
                     {
-                        // 当次提交不包含任何 AutoSave 草稿时，说明内容源自正式保存，更新 refs/hammer5git/last-formal 锚点
-                        if (!anyAutoSave)
-                        {
-                            await _gitService.UpdateFormalAnchorRefAsync(Profile, commit.Hash, _cts.Token);
-                        }
-
-                        _parent.SaveProvenanceStore(Profile);
-
                         if (!isInitialBaseline && !ShadowGitService.IsInitOrMetadataCommitSubject(commit.Subject))
                         {
                             _parent.NotifyCommitCreated(Profile.AddonName, commit);
-                            _parent.NotifyLogMessage(Profile.AddonName, $"自动提交成功 [{commit.ShortHash}]: {commit.Subject}");
+                            _parent.NotifyLogMessage(Profile.AddonName, $"正式提交成功 [{commit.ShortHash}]: {commit.Subject}");
                         }
                     }
+                }
+
+                // --- 2. 自动保存通道 (autosave Worktree) ---
+                foreach (var group in autoSaveCandidates.GroupBy(c => c.CanonicalRelativePath, StringComparer.OrdinalIgnoreCase))
+                {
+                    var winner = VmapConverterAndSanitizer.SelectNewestVmapCandidate(group);
+                    if (!_parent.ShouldAcceptAutoSaveCandidate(Profile.AddonName, winner.CanonicalRelativePath, winner.LastWriteTimeUtc))
+                        continue;
+
+                    var res = await _parent.ProcessSingleFileChangeAsync(Profile, winner.FullSourcePath, isGameSide: false, isDeleted: false, _cts.Token);
+                    if (res.Processed && !string.IsNullOrEmpty(res.SummaryFragment))
+                    {
+                        autoSummaries.Add(res.SummaryFragment);
+                        _parent.AdvanceAutoSaveWatermark(Profile.AddonName, winner.CanonicalRelativePath, winner.LastWriteTimeUtc);
+                    }
+                }
+
+                if (autoSummaries.Count > 0)
+                {
+                    string autoMsg = BuildAggregateCommitMessage("[AutoSave]", autoSummaries);
+                    var autoCommit = await _gitService.CommitAutoSaveChangesAsync(Profile, autoMsg, _config.MaxAutoCommits, _cts.Token);
+                    if (autoCommit != null)
+                    {
+                        _parent.NotifyCommitCreated(Profile.AddonName, autoCommit);
+                        _parent.NotifyLogMessage(Profile.AddonName, $"自动保存提交成功 [{autoCommit.ShortHash}]: {autoCommit.Subject}");
+                    }
+                }
+
+                if (mainSummaries.Count > 0 || autoSummaries.Count > 0)
+                {
+                    _parent.NotifyTrackedFilesChanged(Profile.AddonName);
                 }
             }
             catch (OperationCanceledException)
             {
-                // 取消视为正常退出，静默 return
                 return;
             }
             catch (ObjectDisposedException)
             {
-                // 对象销毁视为正常退出，静默 return
                 return;
             }
             catch (Exception ex)
             {
-                // 其他异常照旧上报日志，但绝不能逃逸到线程池
                 try
                 {
                     _parent.NotifyLogMessage(Profile.AddonName, $"监控处理异常: {ex.Message}");
                 }
                 catch
                 {
-                    // 确保日志上报异常也不逃逸
                 }
             }
             finally
@@ -1554,13 +1086,6 @@ public class AddonWatcherService : IDisposable
 
             _debounceTimer?.Dispose();
             _debounceTimer = null;
-
-            _reconcileTimer?.Dispose();
-            _reconcileTimer = null;
-
-            // 删除 _flushLock.Dispose() 与 _cts.Dispose() 的立即同步调用：
-            // 这两个对象没有非托管句柄（SemaphoreSlim 未使用 AvailableWaitHandle、CTS 未挂计时器），
-            // 交给 GC 回收即可；提前 Dispose 才是竞态的根源。
         }
     }
 }
