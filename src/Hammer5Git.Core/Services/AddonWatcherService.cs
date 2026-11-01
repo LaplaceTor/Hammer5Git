@@ -22,7 +22,6 @@ public class AddonWatcherService : IDisposable
 
     private readonly Dictionary<string, AddonWatchSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _suppressedPaths = new(StringComparer.OrdinalIgnoreCase);
-    private FileSystemWatcher? _rootAddonsWatcher;
 
     // Key: "{addonName}|{canonicalRelPath}" (OrdinalIgnoreCase), Value: 已同步源文件的元数据与单调水位线
     private readonly ConcurrentDictionary<string, VmapProvenanceMetadata> _provenanceStore = new(StringComparer.OrdinalIgnoreCase);
@@ -187,7 +186,6 @@ public class AddonWatcherService : IDisposable
     public event Action<CorruptedFileAlert>? CorruptedFileDetected;
     public event Action<string, string>? LogMessage;
     public event Action<string>? TrackedFilesChanged;
-    public event Action<AddonProfile>? NewAddonDiscovered;
 
     public AddonWatcherService(
         AppConfig config,
@@ -204,75 +202,6 @@ public class AddonWatcherService : IDisposable
     public bool IsWatching(string addonName) => _sessions.ContainsKey(addonName);
 
     public int ActiveWatchCount => _sessions.Count;
-
-    /// <summary>
-    /// Watches the CS2 content/csgo_addons root folder so newly created addons are automatically discovered and monitored.
-    /// </summary>
-    public void StartRootAddonsDirectoryWatcher(string cs2InstallPath)
-    {
-        StopRootAddonsDirectoryWatcher();
-
-        if (string.IsNullOrWhiteSpace(cs2InstallPath))
-            return;
-
-        string contentAddonsDir = Path.Combine(cs2InstallPath, "content", "csgo_addons");
-        if (!Directory.Exists(contentAddonsDir))
-            return;
-
-        _rootAddonsWatcher = new FileSystemWatcher(contentAddonsDir)
-        {
-            IncludeSubdirectories = false,
-            NotifyFilter = NotifyFilters.DirectoryName
-        };
-
-        _rootAddonsWatcher.Created += (_, e) => _ = TryDiscoverNewAddonDirAsync(e.FullPath);
-        _rootAddonsWatcher.Renamed += (_, e) => _ = TryDiscoverNewAddonDirAsync(e.FullPath);
-        _rootAddonsWatcher.EnableRaisingEvents = true;
-    }
-
-    public void StopRootAddonsDirectoryWatcher()
-    {
-        if (_rootAddonsWatcher != null)
-        {
-            _rootAddonsWatcher.EnableRaisingEvents = false;
-            _rootAddonsWatcher.Dispose();
-            _rootAddonsWatcher = null;
-        }
-    }
-
-    private async Task TryDiscoverNewAddonDirAsync(string fullDirPath)
-    {
-        try
-        {
-            await Task.Delay(600);
-            if (!Directory.Exists(fullDirPath))
-                return;
-
-            string name = Path.GetFileName(fullDirPath);
-            if (Cs2EnvironmentService.IsExcludedAddonName(name) || IsWatching(name))
-                return;
-
-            var gameAddonsDir = Path.Combine(_config.Cs2InstallPath, "game", "csgo_addons");
-            var profile = new AddonProfile
-            {
-                AddonName = name,
-                ContentAddonPath = fullDirPath,
-                GameAddonPath = Path.Combine(gameAddonsDir, name),
-                ShadowRepoPath = Path.Combine(_config.DefaultReposRoot, name),
-                IsMonitoringEnabled = true,
-                TrackGameSideConfigs = true,
-                StatusText = "监控中"
-            };
-
-            await StartWatchingAsync(profile, performInitialSync: true);
-            LogMessage?.Invoke(name, $"自动检测到新创建的 Addon 项目并纳入实时守护: {name}");
-            NewAddonDiscovered?.Invoke(profile);
-        }
-        catch (Exception ex)
-        {
-            LogMessage?.Invoke("System", $"自动纳管新 Addon 异常: {ex.Message}");
-        }
-    }
 
     /// <summary>
     /// Temporarily suppresses FileSystemWatcher events for a specific path (e.g., when overwriting a file during restore)
@@ -1129,7 +1058,6 @@ public class AddonWatcherService : IDisposable
 
         if (disposing)
         {
-            StopRootAddonsDirectoryWatcher();
             foreach (var s in _sessions.Values)
             {
                 s.Dispose();

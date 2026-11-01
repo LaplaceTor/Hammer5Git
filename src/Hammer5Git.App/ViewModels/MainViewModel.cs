@@ -278,23 +278,6 @@ public sealed class MainViewModel : ObservableModel, IDisposable
             });
         };
 
-        WatcherService.NewAddonDiscovered += profile =>
-        {
-            _dispatcher.TryEnqueue(() =>
-            {
-                if (!Addons.Any(a => a.AddonName.Equals(profile.AddonName, StringComparison.OrdinalIgnoreCase)))
-                {
-                    Addons.Add(profile);
-                    Config.Addons.Add(profile);
-                    Config.Save();
-                    if (SelectedAddon == null)
-                    {
-                        SelectedAddon = profile;
-                    }
-                }
-            });
-        };
-
         WatcherService.CommitCreated += (addonName, record) =>
         {
             _dispatcher.TryEnqueue(() =>
