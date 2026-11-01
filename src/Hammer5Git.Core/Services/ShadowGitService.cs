@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -45,7 +45,8 @@ public class ShadowGitService
     public static readonly HashSet<string> IgnoredFileNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "tools_thumbnail_cache.bin",
-        "readonly_tools_asset_info.bin"
+        "readonly_tools_asset_info.bin",
+        "AssetBrowserSavedSearches.kv3"
     };
 
     public static readonly string[] GitIgnoreFixedLines =
@@ -154,6 +155,12 @@ public class ShadowGitService
         gitattributes.AppendLine("*.vmdl text eol=lf");
         gitattributes.AppendLine("*.vsmart text eol=lf");
         gitattributes.AppendLine("*.kv3 text eol=lf");
+        gitattributes.AppendLine("*.vsndevts text eol=lf");
+        gitattributes.AppendLine("*.vpost text eol=lf");
+        gitattributes.AppendLine("*.vdata text eol=lf");
+        gitattributes.AppendLine("*.vpcf text eol=lf");
+        gitattributes.AppendLine("*.vmdl_prefab text eol=lf");
+        gitattributes.AppendLine("*.vpdi text eol=lf");
 
         if (trackedLfs.Count > 0)
         {
@@ -230,11 +237,11 @@ public class ShadowGitService
         if (string.IsNullOrEmpty(ext))
             return false;
 
-        // _toolsautosave 根下仅追踪 .vmap 文件
+        // _toolsautosave 根下追踪 .vmap 与 .vmap_autosave 文件
         if (isFromAutoSaveRoot)
-            return ext.Equals(".vmap", StringComparison.OrdinalIgnoreCase);
+            return VmapConverterAndSanitizer.IsTrackableVmapExtension(ext);
 
-        if (!isGameSide && ext.Equals(".vmap", StringComparison.OrdinalIgnoreCase))
+        if (!isGameSide && VmapConverterAndSanitizer.IsTrackableVmapExtension(ext))
             return true;
 
         if (DefaultTextExtensions.Contains(ext))
@@ -697,6 +704,178 @@ public class ShadowGitService
             }
 
             return (true, "已成功推送分支与里程碑标签至远程仓库。");
+        });
+    }
+
+    /// <summary>
+    /// 记录最近一次源于正式保存的提交哈希至专用引用 refs/hammer5git/last-formal。
+    /// </summary>
+    public Task UpdateFormalAnchorRefAsync(AddonProfile profile, string commitHash, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(commitHash))
+            return Task.CompletedTask;
+
+        return WithRepoLockAsync(profile.ShadowRepoPath, ct, async () =>
+        {
+            try
+            {
+                await RunGitAsync(profile.ShadowRepoPath, ["update-ref", "refs/hammer5git/last-formal", commitHash.Trim()], ct);
+            }
+            catch
+            {
+                // 静默忽略失败，best-effort
+            }
+        });
+    }
+
+    /// <summary>
+    /// 获取 refs/hammer5git/last-formal 记录的正式锚点提交哈希。
+    /// </summary>
+    public Task<(bool Success, string CommitHash)> TryGetFormalAnchorCommitAsync(AddonProfile profile, CancellationToken ct = default)
+    {
+        if (!Directory.Exists(Path.Combine(profile.ShadowRepoPath, ".git")))
+            return Task.FromResult((false, string.Empty));
+
+        return WithRepoLockAsync(profile.ShadowRepoPath, ct, () => TryGetFormalAnchorCommitInternalAsync(profile.ShadowRepoPath, ct));
+    }
+
+    private async Task<(bool Success, string CommitHash)> TryGetFormalAnchorCommitInternalAsync(string repoPath, CancellationToken ct)
+    {
+        try
+        {
+            var res = await RunGitAsync(repoPath, ["rev-parse", "--verify", "refs/hammer5git/last-formal"], ct);
+            if (res.ExitCode == 0 && !string.IsNullOrWhiteSpace(res.StdOut))
+            {
+                return (true, res.StdOut.Trim());
+            }
+            return (false, string.Empty);
+        }
+        catch
+        {
+            return (false, string.Empty);
+        }
+    }
+
+    /// <summary>
+    /// 检查当前 HEAD 是否已被推送至远程仓库 origin/main 分支。
+    /// </summary>
+    public Task<bool> IsHeadPushedToRemoteAsync(AddonProfile profile, CancellationToken ct = default)
+    {
+        if (!Directory.Exists(Path.Combine(profile.ShadowRepoPath, ".git")))
+            return Task.FromResult(false);
+
+        return WithRepoLockAsync(profile.ShadowRepoPath, ct, () => IsHeadPushedToRemoteInternalAsync(profile.ShadowRepoPath, ct));
+    }
+
+    private async Task<bool> IsHeadPushedToRemoteInternalAsync(string repoPath, CancellationToken ct)
+    {
+        try
+        {
+            var remotes = await RunGitAsync(repoPath, ["remote"], ct);
+            if (remotes.ExitCode != 0 || !remotes.StdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).Contains("origin"))
+            {
+                return false;
+            }
+
+            var refCheck = await RunGitAsync(repoPath, ["rev-parse", "--verify", "origin/main"], ct);
+            if (refCheck.ExitCode != 0)
+            {
+                return false;
+            }
+
+            var mergeBase = await RunGitAsync(repoPath, ["merge-base", "--is-ancestor", "HEAD", "origin/main"], ct);
+            return mergeBase.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 将影子仓库安全回退至正式存档锚点 refs/hammer5git/last-formal。
+    /// </summary>
+    public Task<(FormalAnchorRollbackResult Result, string Message)> RollbackToFormalAnchorAsync(
+        AddonProfile profile, string mapDisplayName, CancellationToken ct = default)
+    {
+        if (!Directory.Exists(Path.Combine(profile.ShadowRepoPath, ".git")))
+            return Task.FromResult((FormalAnchorRollbackResult.Failed, "影子仓库未初始化"));
+
+        return WithRepoLockAsync(profile.ShadowRepoPath, ct, async () =>
+        {
+            try
+            {
+                var (hasAnchor, anchorHash) = await TryGetFormalAnchorCommitInternalAsync(profile.ShadowRepoPath, ct);
+                if (!hasAnchor || string.IsNullOrWhiteSpace(anchorHash))
+                {
+                    return (FormalAnchorRollbackResult.Failed, "未找到正式存档锚点 (refs/hammer5git/last-formal)");
+                }
+
+                var headRes = await RunGitAsync(profile.ShadowRepoPath, ["rev-parse", "HEAD"], ct);
+                if (headRes.ExitCode != 0 || string.IsNullOrWhiteSpace(headRes.StdOut))
+                {
+                    return (FormalAnchorRollbackResult.Failed, "无法获取当前 HEAD 提交");
+                }
+                string currentHead = headRes.StdOut.Trim();
+
+                if (string.Equals(currentHead, anchorHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    return (FormalAnchorRollbackResult.AlreadyAligned, "当前 HEAD 已与正式存档锚点一致");
+                }
+
+                bool isPushed = await IsHeadPushedToRemoteInternalAsync(profile.ShadowRepoPath, ct);
+                if (isPushed)
+                {
+                    return (FormalAnchorRollbackResult.RequiresForwardReconcile, "当前 HEAD 已推送至远程仓库，不可执行 reset --hard，需要前向对齐提交");
+                }
+
+                // PART2-a: 在执行 reset --hard 之前，验证从 anchorHash 到 HEAD 之间的提交区间是否纯净。
+                // 运行 git rev-list --format=%s <anchorHash>..HEAD
+                // 要求该区间内每一个提交主题都必须以 "[AutoSave]" 开头。
+                // 若区间内存在非 [AutoSave] 提交（如其他地图的正式保存、常规资产变更），绝不可 reset --hard，必须回退至前向对齐。
+                var revListRes = await RunGitAsync(profile.ShadowRepoPath, ["rev-list", "--format=%s", $"{anchorHash}..HEAD"], ct);
+                if (revListRes.ExitCode != 0)
+                {
+                    return (FormalAnchorRollbackResult.Failed, $"检查提交历史纯净度失败: {revListRes.StdErr}".Trim());
+                }
+
+                var lines = revListRes.StdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+                var subjectLines = lines
+                    .Where(l => !l.StartsWith("commit ", StringComparison.Ordinal))
+                    .Select(l => l.Trim())
+                    .Where(l => l.Length > 0)
+                    .ToList();
+
+                foreach (var subject in subjectLines)
+                {
+                    if (!subject.StartsWith("[AutoSave]", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return (FormalAnchorRollbackResult.RequiresForwardReconcile,
+                            $"提交历史区间包含非自动保存草稿的提交 ({subject})，为防止误丢弃其他资产或正式存档，转为前向对齐");
+                    }
+                }
+
+                string rawTagName = $"abandoned_{mapDisplayName}_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+                string cleanTag = new string(rawTagName.Trim().Select(c => char.IsLetterOrDigit(c) || c == '_' || c == '-' || c == '.' ? c : '_').ToArray());
+                if (string.IsNullOrWhiteSpace(cleanTag))
+                {
+                    cleanTag = $"abandoned_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+                }
+
+                await RunGitAsync(profile.ShadowRepoPath, ["tag", "-f", cleanTag, currentHead], ct);
+
+                var resetRes = await RunGitAsync(profile.ShadowRepoPath, ["reset", "--hard", "refs/hammer5git/last-formal"], ct);
+                if (resetRes.ExitCode != 0)
+                {
+                    return (FormalAnchorRollbackResult.Failed, $"Git reset 失败: {resetRes.StdErr} {resetRes.StdOut}".Trim());
+                }
+
+                return (FormalAnchorRollbackResult.RolledBack, $"已将草稿安全归档至标签 {cleanTag} 并硬重置回退至正式存档 {anchorHash[..Math.Min(7, anchorHash.Length)]}");
+            }
+            catch (Exception ex)
+            {
+                return (FormalAnchorRollbackResult.Failed, $"回退异常: {ex.Message}");
+            }
         });
     }
 

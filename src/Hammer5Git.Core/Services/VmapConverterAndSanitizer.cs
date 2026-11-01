@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -25,15 +25,9 @@ public partial class VmapConverterAndSanitizer
     [GeneratedRegex(@"(""defaultcamera""\s+""CStoredCamera""\s*\{[\s\S]*?""position""\s+""vector3""\s+"")([^""]+)(""[\s\S]*?""lookat""\s+""vector3""\s+"")([^""]+)("")", RegexOptions.Compiled)]
     private static partial Regex DefaultCameraRegex();
 
-    // Matches root or nested DMX blocks with id/classname/targetMapPath for smart summary
-    [GeneratedRegex(@"""([A-Za-z0-9_]+)""\s*\{\s*""id""\s+""elementid""\s+""([0-9a-fA-F\-]+)""([\s\S]*?)(?=\r?\n\t*""[A-Za-z0-9_]+""\s*\{\s*""id""|\z)", RegexOptions.Compiled)]
-    private static partial Regex ElementBlockRegex();
-
-    [GeneratedRegex(@"""classname""\s+""string""\s+""([^""]+)""", RegexOptions.Compiled)]
-    private static partial Regex ClassnameRegex();
-
-    [GeneratedRegex(@"""targetMapPath""\s+""string""\s+""([^""]+)""", RegexOptions.Compiled)]
-    private static partial Regex TargetMapPathRegex();
+    // 匹配根节点 $prefix_element$ 中的 elementid，用于替换为固定 GUID 以消除 dmxconvert 输出的非确定性
+    [GeneratedRegex(@"(""\$prefix_element\$""\s*\{\s*""id""\s+""elementid""\s+"")([^""]+)("")", RegexOptions.Compiled)]
+    private static partial Regex PrefixElementIdRegex();
 
     [GeneratedRegex(@"^(.*?)(?:_autosave(?:_\d+)?|_bak(?:_\d+)?)$", RegexOptions.IgnoreCase | RegexOptions.Compiled)]
     private static partial Regex AutoSaveSuffixRegex();
@@ -41,6 +35,28 @@ public partial class VmapConverterAndSanitizer
     // 仅匹配 Hammer 自动保存标准的三位尾号 (例如 _001 .. _005)
     [GeneratedRegex(@"^(.*?)_(\d{3})$", RegexOptions.IgnoreCase | RegexOptions.Compiled)]
     private static partial Regex ThreeDigitAutoSaveSuffixRegex();
+
+    // 匹配 Hammer 实际使用的无下划线三位数字槽位 (例如 test001 .. test005)
+    [GeneratedRegex(@"^(.*?)(\d{3})$", RegexOptions.Compiled)]
+    private static partial Regex ThreeDigitNoUnderscoreAutoSaveSuffixRegex();
+
+    /// <summary>
+    /// 判断给定的文件扩展名是否为 VMAP 相关文件（.vmap 或 .vmap_autosave）。
+    /// </summary>
+    public static bool IsTrackableVmapExtension(string ext)
+        => ext.Equals(".vmap", StringComparison.OrdinalIgnoreCase) ||
+           ext.Equals(".vmap_autosave", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 判断给定文件路径是否为 VMAP 相关文件（.vmap 或 .vmap_autosave）。
+    /// </summary>
+    public static bool IsVmapRelatedFile(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return false;
+        string ext = Path.GetExtension(path);
+        return IsTrackableVmapExtension(ext);
+    }
 
     public VmapConverterAndSanitizer(string dmxConvertPath)
     {
@@ -307,7 +323,8 @@ public partial class VmapConverterAndSanitizer
     }
 
     /// <summary>
-    /// Strips the asset_preview_thumbnail HEX payload and resets defaultcamera position & lookat to "0 0 0".
+    /// Strips the asset_preview_thumbnail HEX payload, resets defaultcamera position & lookat to "0 0 0",
+    /// and standardizes the root $prefix_element$ elementid to an all-zero GUID for deterministic output.
     /// </summary>
     public static string SanitizeKv2Text(string rawKv2)
     {
@@ -318,11 +335,20 @@ public partial class VmapConverterAndSanitizer
         string step2 = DefaultCameraRegex().Replace(step1, m =>
             $"{m.Groups[1].Value}0 0 0{m.Groups[3].Value}0 0 0{m.Groups[5].Value}");
 
-        return step2;
+        // 3. 将根节点 $prefix_element$ 的 elementid 归一化为全零固定 GUID，以消除 dmxconvert 每次调用重新生成随机 GUID 导致的非确定性。
+        // 【关键安全边界】：严禁将此正则匹配范围扩大到全文的其他 elementid！
+        // VmapSemanticAnalyzer 将每个实体的 GUID 用作主键，供 AnalyzeVmapSemanticDiff 准确识别实体的
+        // 新增 (Added)、修改 (Modified) 与删除 (Deleted)。若将所有 elementid 归一化，将破坏语义差异分析；
+        // 而 $prefix_element$ 不属于语义类白名单，对其 GUID 进行固定
+        // 既保障了多次转换输出完全一致 (Ordinal-equal)，又完全不会影响下游的任何语义分析与逻辑判定。
+        string step3 = PrefixElementIdRegex().Replace(step2, m =>
+            $"{m.Groups[1].Value}00000000-0000-0000-0000-000000000000{m.Groups[3].Value}");
+
+        return step3;
     }
 
     /// <summary>
-    /// Maps an autosave VMAP path (e.g. maps/_autosave/test_001.vmap or maps/test_autosave_01.vmap or _toolsautosave maps/test_001.vmap)
+    /// Maps an autosave VMAP path (e.g. maps/_autosave/test_001.vmap or maps/test_autosave_01.vmap or _toolsautosave maps/test001.vmap_autosave)
     /// back to its canonical relative path inside the addon (e.g. content/maps/test.vmap).
     /// Also indicates whether the file was an autosave.
     /// </summary>
@@ -335,12 +361,14 @@ public partial class VmapConverterAndSanitizer
         string fileNameNoExt = Path.GetFileNameWithoutExtension(normalized);
         string ext = Path.GetExtension(normalized);
 
-        if (!ext.Equals(".vmap", StringComparison.OrdinalIgnoreCase))
+        // 仅处理 .vmap 与 .vmap_autosave，其余扩展名保持原样返回
+        if (!IsTrackableVmapExtension(ext))
         {
             return ($"content/{normalized}", false);
         }
 
-        bool isAutoSave = isFromAutoSaveRoot;
+        // 扩展名为 .vmap_autosave 时，无论是否在 AutoSave 根目录下，均直接判定为自动保存草稿
+        bool isAutoSave = isFromAutoSaveRoot || ext.Equals(".vmap_autosave", StringComparison.OrdinalIgnoreCase);
 
         // 兼容旧式 maps/_autosave/ 子目录结构
         var dirParts = dir.Split('/', StringSplitOptions.RemoveEmptyEntries).ToList();
@@ -360,13 +388,24 @@ public partial class VmapConverterAndSanitizer
             isAutoSave = true;
             fileNameNoExt = explicitMatch.Groups[1].Value;
         }
-        // 分支 B: 仅当来自 _toolsautosave 根或 _autosave 子目录时，才剥离末尾三位数字 _\d{3}
+        // 分支 B: 仅当已确定为自动保存草稿时，才剥离末尾三位数字
         else if (isAutoSave)
         {
+            // 优先匹配带下划线的形式 _\d{3} (如 test_001.vmap)
             var numMatch = ThreeDigitAutoSaveSuffixRegex().Match(fileNameNoExt);
             if (numMatch.Success && !string.IsNullOrWhiteSpace(numMatch.Groups[1].Value))
             {
                 fileNameNoExt = numMatch.Groups[1].Value;
+            }
+            else
+            {
+                // 再匹配 Hammer 实际生成的无下划线三位数字槽位形式 \d{3} (如 test001.vmap_autosave)
+                // 仅当剥离后仍至少保留 1 个字符时才剥离，防止形如 "001" 的地图名被剥离为空
+                var noUnderscoreMatch = ThreeDigitNoUnderscoreAutoSaveSuffixRegex().Match(fileNameNoExt);
+                if (noUnderscoreMatch.Success && !string.IsNullOrWhiteSpace(noUnderscoreMatch.Groups[1].Value))
+                {
+                    fileNameNoExt = noUnderscoreMatch.Groups[1].Value;
+                }
             }
         }
 
@@ -377,12 +416,23 @@ public partial class VmapConverterAndSanitizer
         return (finalRel, isAutoSave);
     }
 
+    /// <summary>
+    /// 从文件名中提取自动保存槽位编号（支持 test_001 与 test001 两种三位数字槽位格式）。
+    /// </summary>
     public static int ExtractAutoSaveSlotNumber(string filePath)
     {
         string fileNameNoExt = Path.GetFileNameWithoutExtension(filePath);
         var m = ThreeDigitAutoSaveSuffixRegex().Match(fileNameNoExt);
         if (m.Success && int.TryParse(m.Groups[2].Value, out int slot))
             return slot;
+
+        var mNoUnder = ThreeDigitNoUnderscoreAutoSaveSuffixRegex().Match(fileNameNoExt);
+        if (mNoUnder.Success && !string.IsNullOrWhiteSpace(mNoUnder.Groups[1].Value) &&
+            int.TryParse(mNoUnder.Groups[2].Value, out int slotNoUnder))
+        {
+            return slotNoUnder;
+        }
+
         return -1;
     }
 
@@ -391,70 +441,7 @@ public partial class VmapConverterAndSanitizer
     /// Returns whether there is any meaningful map change (excluding noisy camera/selection/visibility/prefix metadata).
     /// </summary>
     public static (bool HasMeaningfulChange, bool IsInitialImport, string Summary) AnalyzeVmapSemanticDiff(string? oldKv2, string newKv2)
-    {
-        if (string.IsNullOrWhiteSpace(oldKv2))
-        {
-            var initialElements = ExtractElementSnapshots(newKv2);
-            int meshCount = initialElements.Values.Count(e => e.Type == "CMapMesh");
-            int entityCount = initialElements.Values.Count(e => e.Type == "CMapEntity");
-            return (true, true, $"初始导入 (包含 {meshCount} 个 Mesh, {entityCount} 个 Entity)");
-        }
-
-        var oldMap = ExtractElementSnapshots(oldKv2);
-        var newMap = ExtractElementSnapshots(newKv2);
-
-        var added = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var removed = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var modified = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
-        HashSet<string> metadataTypes = new(StringComparer.OrdinalIgnoreCase)
-        {
-            "$prefix_element$", "DmePlugList", "EditGameClassProps", "DmElement",
-            "CStoredCamera", "CStoredCameras", "CVisibilityMgr", "CMapSelectionSet",
-            "CObjectSelectionSetDataElement"
-        };
-
-        foreach (var (id, newEl) in newMap)
-        {
-            if (metadataTypes.Contains(newEl.Type))
-                continue;
-
-            if (!oldMap.TryGetValue(id, out var oldEl))
-            {
-                Increment(added, newEl.Label);
-            }
-            else if (oldEl.ContentHash != newEl.ContentHash)
-            {
-                Increment(modified, newEl.Label);
-            }
-        }
-
-        foreach (var (id, oldEl) in oldMap)
-        {
-            if (metadataTypes.Contains(oldEl.Type))
-                continue;
-
-            if (!newMap.ContainsKey(id))
-            {
-                Increment(removed, oldEl.Label);
-            }
-        }
-
-        var parts = new List<string>();
-        if (added.Count > 0)
-            parts.Add("新增 " + FormatCounts(added));
-        if (modified.Count > 0)
-            parts.Add("变更 " + FormatCounts(modified));
-        if (removed.Count > 0)
-            parts.Add("删除 " + FormatCounts(removed));
-
-        if (parts.Count == 0)
-        {
-            return (false, false, string.Empty);
-        }
-
-        return (true, false, string.Join("; ", parts));
-    }
+        => VmapSemanticAnalyzer.AnalyzeDiff(oldKv2, newKv2);
 
     /// <summary>
     /// Generates an intelligent semantic summary by comparing old and new KV2 text of a VMAP.
@@ -464,54 +451,6 @@ public partial class VmapConverterAndSanitizer
     {
         var (hasMeaningfulChange, _, summary) = AnalyzeVmapSemanticDiff(oldKv2, newKv2);
         return hasMeaningfulChange ? summary : "更新地图属性/全局配置";
-    }
-
-    private static void Increment(Dictionary<string, int> dict, string key)
-    {
-        dict.TryGetValue(key, out int count);
-        dict[key] = count + 1;
-    }
-
-    private static string FormatCounts(Dictionary<string, int> dict)
-    {
-        var top = dict.OrderByDescending(kv => kv.Value).Take(3)
-            .Select(kv => $"{kv.Value} 个 {kv.Key}");
-        string res = string.Join(", ", top);
-        if (dict.Count > 3)
-            res += $" 等({dict.Values.Sum()}项)";
-        return res;
-    }
-
-    private record ElementSnapshot(string Id, string Type, string Label, int ContentHash);
-
-    private static Dictionary<string, ElementSnapshot> ExtractElementSnapshots(string kv2)
-    {
-        var result = new Dictionary<string, ElementSnapshot>(StringComparer.OrdinalIgnoreCase);
-        var matches = ElementBlockRegex().Matches(kv2);
-        foreach (Match m in matches)
-        {
-            string type = m.Groups[1].Value;
-            string id = m.Groups[2].Value;
-            string body = m.Groups[3].Value;
-
-            string label = type;
-            if (type == "CMapEntity" || type == "EditGameClassProps")
-            {
-                var clsMatch = ClassnameRegex().Match(body);
-                if (clsMatch.Success)
-                    label = clsMatch.Groups[1].Value;
-            }
-            else if (type == "CMapPrefab")
-            {
-                var prefabMatch = TargetMapPathRegex().Match(body);
-                if (prefabMatch.Success)
-                    label = $"Prefab({Path.GetFileNameWithoutExtension(prefabMatch.Groups[1].Value)})";
-            }
-
-            int hash = body.GetHashCode(StringComparison.Ordinal);
-            result[id] = new ElementSnapshot(id, type, label, hash);
-        }
-        return result;
     }
 
     public readonly record struct VmapSourceCandidate(

@@ -9,4 +9,10 @@
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- KeyValues2 (Datamodel.NET): https://github.com/ValveResourceFormat/Datamodel.NET -->
+    <PackageReference Include="KeyValues2" Version="1.0.0" />
+    <PackageReference Include="System.IO.Hashing" Version="10.0.14" />
+  </ItemGroup>
+
 </Project>
