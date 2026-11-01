@@ -169,11 +169,16 @@ jobs:
           $scdDir = "$outRoot/Hammer5Git-v$ver-win-x64-selfcontained"
           $scdZip = "$outRoot/Hammer5Git-v$ver-win-x64-selfcontained.zip"
 
+          # 清理旧的 runtimeconfig 缓存，防止 MSBuild 增量构建污染
+          Get-Item "dist/Hammer5Git.runtimeconfig*.json" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          Get-Item "src/Hammer5Git.Main/obj/Release/*/win-x64/Hammer5Git.runtimeconfig*.json" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
           Write-Host ">>> 正在构建自包含独立版..." -ForegroundColor Cyan
           dotnet publish $project `
             -c Release `
             -r win-x64 `
             --self-contained true `
+            -p:SelfContained=true `
             -p:WindowsAppSDKSelfContained=true `
             -p:Version=$ver `
             -p:DebugType=none `
@@ -196,6 +201,32 @@ jobs:
           # 深度剔除全部未使用的内置组件与运行时
           Prune-UnusedArtifacts -dir $scdDir -isSelfContained $true
 
+          # 严格核验并纠正 runtimeconfig.json 格式，杜绝自包含包残留 framework 声明
+          $scdRcPath = "$scdDir/Hammer5Git.runtimeconfig.json"
+          if (Test-Path $scdRcPath) {
+            try {
+              $rcJson = Get-Content $scdRcPath -Raw -Encoding utf8 | ConvertFrom-Json
+              if ($rcJson.runtimeOptions.framework -or (-not $rcJson.runtimeOptions.includedFrameworks)) {
+                $fwVer = "10.0.0"
+                if ($rcJson.runtimeOptions.framework -and $rcJson.runtimeOptions.framework.version) {
+                  $fwVer = $rcJson.runtimeOptions.framework.version
+                }
+                $rcJson.runtimeOptions | Add-Member -NotePropertyName "includedFrameworks" -NotePropertyValue @(
+                  [PSCustomObject]@{
+                    name = "Microsoft.NETCore.App"
+                    version = $fwVer
+                  }
+                ) -Force
+                if ($rcJson.runtimeOptions.PSObject.Properties['framework']) {
+                  $rcJson.runtimeOptions.PSObject.Properties.Remove('framework')
+                }
+                $rcJson | ConvertTo-Json -Depth 10 | Set-Content $scdRcPath -Encoding utf8
+              }
+            } catch {
+              Write-Warning "校验 scd runtimeconfig.json 失败: $_"
+            }
+          }
+
           Write-Host ">>> 压缩自包含版为 Zip..." -ForegroundColor Cyan
           Compress-Archive -Path "$scdDir/*" -DestinationPath $scdZip -CompressionLevel Optimal
 
@@ -205,11 +236,16 @@ jobs:
           $fddDir = "$outRoot/Hammer5Git-v$ver-win-x64-dependent"
           $fddZip = "$outRoot/Hammer5Git-v$ver-win-x64-dependent.zip"
 
+          # 清理旧的 runtimeconfig 缓存
+          Get-Item "dist/Hammer5Git.runtimeconfig*.json" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          Get-Item "src/Hammer5Git.Main/obj/Release/*/win-x64/Hammer5Git.runtimeconfig*.json" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
           Write-Host ">>> 正在构建框架依赖版..." -ForegroundColor Cyan
           dotnet publish $project `
             -c Release `
             -r win-x64 `
             --self-contained false `
+            -p:SelfContained=false `
             -p:WindowsAppSDKSelfContained=true `
             -p:Version=$ver `
             -p:DebugType=none `
@@ -231,6 +267,32 @@ jobs:
 
           # 剔除未使用的组件
           Prune-UnusedArtifacts -dir $fddDir -isSelfContained $false
+
+          # 严格核验并纠正 runtimeconfig.json 格式并清理残留 host 核心库
+          $fddRcPath = "$fddDir/Hammer5Git.runtimeconfig.json"
+          if (Test-Path $fddRcPath) {
+            try {
+              $rcJson = Get-Content $fddRcPath -Raw -Encoding utf8 | ConvertFrom-Json
+              if (-not $rcJson.runtimeOptions.framework -and $rcJson.runtimeOptions.includedFrameworks) {
+                $rcJson.runtimeOptions | Add-Member -NotePropertyName "framework" -NotePropertyValue (
+                  [PSCustomObject]@{
+                    name = "Microsoft.NETCore.App"
+                    version = "10.0.0"
+                  }
+                ) -Force
+                $rcJson.runtimeOptions.PSObject.Properties.Remove('includedFrameworks')
+                $rcJson | ConvertTo-Json -Depth 10 | Set-Content $fddRcPath -Encoding utf8
+              }
+              @("hostfxr.dll", "hostpolicy.dll", "coreclr.dll", "clrjit.dll") | ForEach-Object {
+                $localHostDll = "$fddDir/$_"
+                if (Test-Path $localHostDll) {
+                  Remove-Item $localHostDll -Force -ErrorAction SilentlyContinue
+                }
+              }
+            } catch {
+              Write-Warning "校验 fdd runtimeconfig.json 失败: $_"
+            }
+          }
 
           Write-Host ">>> 压缩框架依赖版为 Zip..." -ForegroundColor Cyan
           Compress-Archive -Path "$fddDir/*" -DestinationPath $fddZip -CompressionLevel Optimal
