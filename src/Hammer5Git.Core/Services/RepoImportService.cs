@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -158,18 +158,28 @@ public sealed class RepoImportService
         if (string.IsNullOrWhiteSpace(profile.ShadowRepoPath) || !Directory.Exists(profile.ShadowRepoPath))
             return;
 
-        var allFiles = Directory.GetFiles(profile.ShadowRepoPath, "*.*", SearchOption.AllDirectories);
-        foreach (var file in allFiles)
-        {
-            string rel = Path.GetRelativePath(profile.ShadowRepoPath, file).Replace('\\', '/');
-            if (rel.StartsWith(".git/", StringComparison.OrdinalIgnoreCase) || rel.Equals(".git", StringComparison.OrdinalIgnoreCase))
-                continue;
+        // 优化：仅枚举 content 与 game 目标子目录，避免扫描 .git 庞大的对象树
+        string repoContentDir = Path.Combine(profile.ShadowRepoPath, "content");
+        string repoGameDir = Path.Combine(profile.ShadowRepoPath, "game");
 
-            if (rel.StartsWith("content/", StringComparison.OrdinalIgnoreCase))
+        if (Directory.Exists(repoContentDir) && !string.IsNullOrWhiteSpace(profile.ContentAddonPath))
+        {
+            string contentDestRoot = Path.GetFullPath(profile.ContentAddonPath);
+            foreach (var file in Directory.EnumerateFiles(repoContentDir, "*.*", SearchOption.AllDirectories))
             {
-                string subRel = rel["content/".Length..];
-                string destPath = Path.Combine(profile.ContentAddonPath, subRel);
-                Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+                string rel = Path.GetRelativePath(repoContentDir, file);
+                string destPath = Path.GetFullPath(Path.Combine(contentDestRoot, rel));
+
+                // 安全校验：确保目标绝对路径严格位于目标目录树下，防止路径穿越 (Path Traversal)
+                if (!IsSubPathOf(destPath, contentDestRoot))
+                    continue;
+
+                string? dir = Path.GetDirectoryName(destPath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+
                 _watcherService.SuppressPathEvents(destPath, TimeSpan.FromSeconds(5));
 
                 if (rel.EndsWith(".vmap", StringComparison.OrdinalIgnoreCase))
@@ -185,14 +195,47 @@ public sealed class RepoImportService
                     File.Copy(file, destPath, overwrite: true);
                 }
             }
-            else if (rel.StartsWith("game/", StringComparison.OrdinalIgnoreCase))
+        }
+
+        if (Directory.Exists(repoGameDir) && !string.IsNullOrWhiteSpace(profile.GameAddonPath))
+        {
+            string gameDestRoot = Path.GetFullPath(profile.GameAddonPath);
+            foreach (var file in Directory.EnumerateFiles(repoGameDir, "*.*", SearchOption.AllDirectories))
             {
-                string subRel = rel["game/".Length..];
-                string destPath = Path.Combine(profile.GameAddonPath, subRel);
-                Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+                string rel = Path.GetRelativePath(repoGameDir, file);
+                string destPath = Path.GetFullPath(Path.Combine(gameDestRoot, rel));
+
+                // 安全校验：确保目标绝对路径严格位于目标目录树下，防止路径穿越 (Path Traversal)
+                if (!IsSubPathOf(destPath, gameDestRoot))
+                    continue;
+
+                string? dir = Path.GetDirectoryName(destPath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+
                 _watcherService.SuppressPathEvents(destPath, TimeSpan.FromSeconds(5));
                 File.Copy(file, destPath, overwrite: true);
             }
+        }
+    }
+
+    internal static bool IsSubPathOf(string candidatePath, string rootPath)
+    {
+        if (string.IsNullOrWhiteSpace(candidatePath) || string.IsNullOrWhiteSpace(rootPath))
+            return false;
+
+        try
+        {
+            string fullCandidate = Path.GetFullPath(candidatePath);
+            string fullRoot = Path.GetFullPath(rootPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+
+            return fullCandidate.Length > fullRoot.Length && fullCandidate.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
         }
     }
 

@@ -470,12 +470,13 @@ public class ShadowGitService
                 return list;
 
             var lines = res.StdOut.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+            var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var line in lines)
             {
                 var parts = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length >= 2)
                 {
-                    if (!list.Any(x => x.RelativePath.Equals(parts[1], StringComparison.OrdinalIgnoreCase)))
+                    if (seenPaths.Add(parts[1]))
                     {
                         list.Add(new ChangedFileEntry
                         {
@@ -893,34 +894,6 @@ public class ShadowGitService
         return ProcessRunner.RunAsync("git", arguments, workingDir, DefaultGitTimeout, DefaultGitEnvironment, ct);
     }
 
-    public async Task<(int ExitCode, string StdOut, string StdErr)> RunGitAsync(string workingDir, string arguments, CancellationToken ct = default)
-    {
-        var psi = CreateGitStartInfo(workingDir, arguments);
-
-        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("无法启动 git 进程，请确认系统已安装 Git。");
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(DefaultGitTimeout);
-
-        try
-        {
-            var stdOutTask = proc.StandardOutput.ReadToEndAsync(timeoutCts.Token);
-            var stdErrTask = proc.StandardError.ReadToEndAsync(timeoutCts.Token);
-            await proc.WaitForExitAsync(timeoutCts.Token);
-
-            return (proc.ExitCode, await stdOutTask, await stdErrTask);
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            try { proc.Kill(entireProcessTree: true); } catch { }
-            return (-99, string.Empty, $"Git 命令执行超时 (>{DefaultGitTimeout.TotalSeconds:0}s): git {arguments}");
-        }
-        catch
-        {
-            try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
-            throw;
-        }
-    }
-
     private Task<(bool Success, string Error)> RunGitToFileAsync(
         string workingDir,
         IReadOnlyList<string> arguments,
@@ -934,6 +907,16 @@ public class ShadowGitService
     {
         try
         {
+            if (string.IsNullOrWhiteSpace(sourcePathOrUrl))
+            {
+                return (false, "源仓库地址或路径不能为空。");
+            }
+
+            if (string.IsNullOrWhiteSpace(targetDir))
+            {
+                return (false, "目标目录不能为空。");
+            }
+
             string? parentDir = Path.GetDirectoryName(targetDir);
             if (!string.IsNullOrEmpty(parentDir))
             {
@@ -942,7 +925,7 @@ public class ShadowGitService
 
             var (exitCode, stdout, stderr) = await RunGitAsync(
                 parentDir ?? AppContext.BaseDirectory,
-                ["clone", sourcePathOrUrl, targetDir],
+                ["clone", "--", sourcePathOrUrl, targetDir],
                 ct);
 
             if (exitCode != 0)
@@ -957,24 +940,5 @@ public class ShadowGitService
         {
             return (false, $"克隆仓库发生异常: {ex.Message}");
         }
-    }
-
-    private static ProcessStartInfo CreateGitStartInfo(string workingDir, string arguments)
-    {
-        var psi = new ProcessStartInfo
-        {
-            FileName = "git",
-            Arguments = arguments,
-            WorkingDirectory = workingDir,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8,
-            CreateNoWindow = true
-        };
-        psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
-        psi.Environment["GCM_INTERACTIVE"] = "never";
-        return psi;
     }
 }

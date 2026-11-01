@@ -17,6 +17,8 @@ public class AddonWatcherService : IDisposable
     private readonly AppConfig _config;
     private readonly ShadowGitService _gitService;
     private readonly VmapConverterAndSanitizer _vmapConverter;
+    private readonly Cs2EnvironmentService _envService;
+    private bool _disposed;
 
     private readonly Dictionary<string, AddonWatchSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _suppressedPaths = new(StringComparer.OrdinalIgnoreCase);
@@ -190,11 +192,13 @@ public class AddonWatcherService : IDisposable
     public AddonWatcherService(
         AppConfig config,
         ShadowGitService gitService,
-        VmapConverterAndSanitizer vmapConverter)
+        VmapConverterAndSanitizer vmapConverter,
+        Cs2EnvironmentService? envService = null)
     {
         _config = config;
         _gitService = gitService;
         _vmapConverter = vmapConverter;
+        _envService = envService ?? new Cs2EnvironmentService();
     }
 
     public bool IsWatching(string addonName) => _sessions.ContainsKey(addonName);
@@ -332,13 +336,37 @@ public class AddonWatcherService : IDisposable
         LogMessage?.Invoke(profile.AddonName, $"实时守护中: {profile.ContentAddonPath}");
     }
 
-    public void StopWatching(string addonName)
+    /// <summary>
+    /// 清理指定 Addon 在内存水位线/溯源记录 (_provenanceStore) 中的所有条目，防止内存泄漏。
+    /// </summary>
+    public void ClearProvenanceForAddon(string addonName)
+    {
+        if (string.IsNullOrWhiteSpace(addonName))
+            return;
+
+        string prefix = $"{addonName.Trim()}|";
+        var keysToRemove = _provenanceStore.Keys
+            .Where(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        foreach (var key in keysToRemove)
+        {
+            _provenanceStore.TryRemove(key, out _);
+        }
+    }
+
+    public void StopWatching(string addonName, bool clearProvenance = false)
     {
         if (_sessions.Remove(addonName, out var session))
         {
             session.Profile.IsMonitoringEnabled = false;
             session.Profile.StatusText = "已停止";
             session.Dispose();
+        }
+
+        if (clearProvenance)
+        {
+            ClearProvenanceForAddon(addonName);
         }
     }
 
@@ -880,6 +908,30 @@ public class AddonWatcherService : IDisposable
         int reconciledCount = 0;
         try
         {
+            // 若 Hammer 或 CS2 正在运行，绝不能误判定草稿被废弃
+            if (_envService.IsHammerOrCs2Running(out _))
+            {
+                // 若此前在 Hammer 关闭时曾记录过废弃观测时间，重置为 default 并持久化，
+                // 确保用户重新打开 Hammer 编辑时草稿不会因为此前累计的观测时间而被误杀回滚。
+                bool changed = false;
+                string pfx = $"{profile.AddonName.Trim()}|";
+                foreach (var kvp in _provenanceStore.Where(kvp => kvp.Key.StartsWith(pfx, StringComparison.OrdinalIgnoreCase)))
+                {
+                    if (kvp.Value.DiscardConditionFirstSeenUtc != default)
+                    {
+                        kvp.Value.DiscardConditionFirstSeenUtc = default;
+                        changed = true;
+                    }
+                }
+
+                if (changed)
+                {
+                    SaveProvenanceStore(profile);
+                }
+
+                return 0;
+            }
+
             string prefix = $"{profile.AddonName.Trim()}|";
             var matchingEntries = _provenanceStore
                 .Where(kvp => kvp.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
@@ -919,15 +971,19 @@ public class AddonWatcherService : IDisposable
 
                 // 判断是否为被丢弃的草稿：当前内容来自 AutoSave，且磁盘正式文件修改时间未晚于基线（1秒容差内），
                 // 说明用户在此后未曾按过保存，Hammer 关闭后草稿已被废弃。
-                bool discarded = entry.LastSourceKind == VmapSourceProvenance.HammerAutoSave
+                // 关键健壮性保护：若 Hammer / CS2 正在运行，绝不能误判定草稿被废弃！
+                bool isHammerRunning = _envService.IsHammerOrCs2Running(out _);
+                bool discarded = !isHammerRunning
+                    && entry.LastSourceKind == VmapSourceProvenance.HammerAutoSave
                     && formalMtimeUtc <= entry.FormalDiskBaselineWriteTimeUtc.AddSeconds(1);
 
                 if (!discarded)
                 {
-                    // 若用户已手动保存或正式文件已更新，重置首次观测时间
+                    // 若用户已手动保存或正式文件已更新，或 Hammer 正在运行，重置首次观测时间
                     if (entry.DiscardConditionFirstSeenUtc != default)
                     {
                         entry.DiscardConditionFirstSeenUtc = default;
+                        SaveProvenanceStore(profile);
                     }
                     continue;
                 }
@@ -951,6 +1007,10 @@ public class AddonWatcherService : IDisposable
                 // 到期执行对齐，检查配置是否开启
                 if (!_config.ReconcileDiscardedAutoSave)
                     continue;
+
+                // 准备执行硬重置前做最终检查：Hammer 绝不能处于运行状态
+                if (_envService.IsHammerOrCs2Running(out _))
+                    return reconciledCount;
 
                 string mapDisplayName = Path.GetFileName(canonicalRel);
                 var (rollbackResult, message) = await _gitService.RollbackToFormalAnchorAsync(profile, mapDisplayName, ct);
@@ -1058,12 +1118,28 @@ public class AddonWatcherService : IDisposable
 
     public void Dispose()
     {
-        StopRootAddonsDirectoryWatcher();
-        foreach (var s in _sessions.Values)
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_disposed)
+            return;
+
+        if (disposing)
         {
-            s.Dispose();
+            StopRootAddonsDirectoryWatcher();
+            foreach (var s in _sessions.Values)
+            {
+                s.Dispose();
+            }
+            _sessions.Clear();
+            _provenanceStore.Clear();
+            _suppressedPaths.Clear();
         }
-        _sessions.Clear();
+
+        _disposed = true;
     }
 
     private sealed class AddonWatchSession : IDisposable

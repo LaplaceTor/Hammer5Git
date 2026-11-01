@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -112,12 +112,20 @@ internal static class ProcessRunner
 
         try
         {
+            var stdErrTask = proc.StandardError.ReadToEndAsync(timeoutCts.Token);
+
+            string? outputDir = Path.GetDirectoryName(outputFilePath);
+            if (!string.IsNullOrEmpty(outputDir))
+            {
+                Directory.CreateDirectory(outputDir);
+            }
+
             await using (var fs = new FileStream(outputFilePath, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 await proc.StandardOutput.BaseStream.CopyToAsync(fs, timeoutCts.Token);
             }
 
-            string err = await proc.StandardError.ReadToEndAsync(timeoutCts.Token);
+            string err = await stdErrTask;
             await proc.WaitForExitAsync(timeoutCts.Token);
             return (proc.ExitCode == 0, err);
         }

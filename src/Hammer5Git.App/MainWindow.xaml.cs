@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -822,7 +822,7 @@ public sealed partial class MainWindow : Window
         if (addon == null || sender is not Button { Tag: string repoRelPath } || string.IsNullOrWhiteSpace(repoRelPath))
             return;
 
-        string fullDiskPath = MainViewModel.ResolveAddonDiskFilePath(addon, repoRelPath);
+        string fullDiskPath = addon.ResolveDiskFilePath(repoRelPath);
         try
         {
             if (File.Exists(fullDiskPath))
@@ -913,7 +913,7 @@ public sealed partial class MainWindow : Window
                 return;
         }
 
-        string targetPath = MainViewModel.ResolveAddonDiskFilePath(addon, repoRelativePath);
+        string targetPath = addon.ResolveDiskFilePath(repoRelativePath);
         if (overwriteOriginal && !string.IsNullOrEmpty(targetPath))
         {
             ViewModel.WatcherService.SuppressPathEvents(targetPath, TimeSpan.FromSeconds(8));

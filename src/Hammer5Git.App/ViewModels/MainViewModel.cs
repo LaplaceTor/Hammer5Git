@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
@@ -259,7 +259,7 @@ public sealed class MainViewModel : ObservableModel, IDisposable
         EnvService = new Cs2EnvironmentService();
         GitService = new ShadowGitService();
         VmapConverter = new VmapConverterAndSanitizer(Config.GetDmxConvertPath());
-        WatcherService = new AddonWatcherService(Config, GitService, VmapConverter);
+        WatcherService = new AddonWatcherService(Config, GitService, VmapConverter, EnvService);
         RepoImportService = new RepoImportService(GitService, EnvService, WatcherService, VmapConverter);
 
         WatcherService.LogMessage += (addon, msg) =>
@@ -605,7 +605,7 @@ public sealed class MainViewModel : ObservableModel, IDisposable
     public async Task RemoveAddonAsync(AddonProfile addon, bool deleteShadowRepo, bool deleteLocalFiles)
     {
         string name = addon.AddonName;
-        WatcherService.StopWatching(name);
+        WatcherService.StopWatching(name, clearProvenance: true);
 
         if (deleteShadowRepo && !string.IsNullOrWhiteSpace(addon.ShadowRepoPath) && Directory.Exists(addon.ShadowRepoPath))
         {
@@ -828,19 +828,6 @@ public sealed class MainViewModel : ObservableModel, IDisposable
         }
     }
 
-    public static string ResolveAddonDiskFilePath(AddonProfile addon, string repoRelativePath)
-    {
-        string normalizedRel = repoRelativePath.Replace('\\', '/').TrimStart('/');
-        bool isGameSide = normalizedRel.StartsWith("game/", StringComparison.OrdinalIgnoreCase);
-        string subPath = normalizedRel.StartsWith("content/", StringComparison.OrdinalIgnoreCase)
-            ? normalizedRel["content/".Length..]
-            : isGameSide
-                ? normalizedRel["game/".Length..]
-                : normalizedRel;
-
-        string baseAddonDir = isGameSide ? addon.GameAddonPath : addon.ContentAddonPath;
-        return Path.Combine(baseAddonDir, subPath.Replace('/', Path.DirectorySeparatorChar));
-    }
 
     private void RebuildMultiFileDiffRows()
     {
@@ -901,7 +888,7 @@ public sealed class MainViewModel : ObservableModel, IDisposable
             }
 
             // 1. Add File Header Row
-            string fullDiskPath = ResolveAddonDiskFilePath(addon, file.RelativePath);
+            string fullDiskPath = addon.ResolveDiskFilePath(file.RelativePath);
             DiffLines.Add(new DiffLineViewModel
             {
                 Kind = DiffLineKind.FileHeader,

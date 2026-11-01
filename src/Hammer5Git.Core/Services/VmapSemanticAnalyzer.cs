@@ -167,17 +167,36 @@ public static class VmapSemanticAnalyzer
 
         hasher.Append(MemoryMarshal.AsBytes(el.ClassName.AsSpan()));
 
-        foreach (var key in el.Keys.OrderBy(k => k, StringComparer.Ordinal))
+        int keyCount = el.Keys.Count;
+        if (keyCount == 0)
+            return;
+
+        string[] rented = ArrayPool<string>.Shared.Rent(keyCount);
+        try
         {
-            if (key is "id" or "name")
-                continue;
+            el.Keys.CopyTo(rented, 0);
+            if (keyCount > 1)
+            {
+                Array.Sort(rented, 0, keyCount, StringComparer.Ordinal);
+            }
 
-            var val = el[key];
-            if (val == null)
-                continue;
+            for (int i = 0; i < keyCount; i++)
+            {
+                string key = rented[i];
+                if (key is "id" or "name")
+                    continue;
 
-            hasher.Append(MemoryMarshal.AsBytes(key.AsSpan()));
-            HashValue(val, hasher, visited);
+                var val = el[key];
+                if (val == null)
+                    continue;
+
+                hasher.Append(MemoryMarshal.AsBytes(key.AsSpan()));
+                HashValue(val, hasher, visited);
+            }
+        }
+        finally
+        {
+            ArrayPool<string>.Shared.Return(rented, clearArray: true);
         }
     }
 
@@ -188,7 +207,9 @@ public static class VmapSemanticAnalyzer
             // 遇到语义子元素边界：只喂入其 GUID，绝不下钻递归
             if (SemanticClasses.Contains(child.ClassName))
             {
-                hasher.Append(child.ID.ToByteArray());
+                Span<byte> guidBytes = stackalloc byte[16];
+                child.ID.TryWriteBytes(guidBytes);
+                hasher.Append(guidBytes);
             }
             else
             {

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.Versioning;
@@ -63,14 +63,6 @@ public static class Cs2InstallationLocator
             string defaultCandidate = Path.Combine(lib, "steamapps", "common", "Counter-Strike Global Offensive");
             if (IsValidCs2Directory(defaultCandidate))
                 return defaultCandidate;
-        }
-
-        // 3. 兜底仍扫描所有库的 common\Counter-Strike Global Offensive
-        foreach (var lib in libraries)
-        {
-            string fallbackCandidate = Path.Combine(lib, "steamapps", "common", "Counter-Strike Global Offensive");
-            if (IsValidCs2Directory(fallbackCandidate))
-                return fallbackCandidate;
         }
 
         return null;

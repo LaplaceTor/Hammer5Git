@@ -302,14 +302,34 @@ public partial class VmapConverterAndSanitizer
         for (int i = 0; i < kv2Text.Length; i++)
         {
             char c = kv2Text[i];
-            if (c == '"' && (i == 0 || kv2Text[i - 1] != '\\'))
+            if (c == '"')
             {
-                inQuotes = !inQuotes;
+                // 计算引号前连续的反斜杠数量：奇数个表示引号被转义，偶数个（含0）表示反斜杠被转义而引号有效
+                int backslashCount = 0;
+                int j = i - 1;
+                while (j >= 0 && kv2Text[j] == '\\')
+                {
+                    backslashCount++;
+                    j--;
+                }
+
+                if ((backslashCount & 1) == 0)
+                {
+                    inQuotes = !inQuotes;
+                }
             }
             else if (!inQuotes)
             {
                 if (c == '{') braceDepth++;
-                else if (c == '}') braceDepth--;
+                else if (c == '}')
+                {
+                    braceDepth--;
+                    if (braceDepth < 0)
+                    {
+                        error = "出现多余的闭合花括号 '}'，KV2 结构不匹配。";
+                        return false;
+                    }
+                }
             }
         }
 

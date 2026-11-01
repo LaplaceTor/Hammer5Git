@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -126,7 +126,7 @@ public class Cs2EnvironmentService
         return true;
     }
 
-    public bool IsHammerOrCs2Running(out List<string> runningProcessNames)
+    public virtual bool IsHammerOrCs2Running(out List<string> runningProcessNames)
     {
         runningProcessNames = new List<string>();
         string[] targetNames = ["cs2", "hammer", "resourcecompiler"];
