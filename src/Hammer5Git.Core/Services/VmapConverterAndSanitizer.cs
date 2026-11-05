@@ -1,7 +1,9 @@
-using System;
+﻿using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Hashing;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -344,7 +346,8 @@ public partial class VmapConverterAndSanitizer
 
     /// <summary>
     /// Strips the asset_preview_thumbnail HEX payload, resets defaultcamera position & lookat to "0 0 0",
-    /// and standardizes the root $prefix_element$ elementid to an all-zero GUID for deterministic output.
+    /// standardizes the root $prefix_element$ elementid to an all-zero GUID, and normalizes all
+    /// inline sub-element elementids to deterministic GUIDs based on their parent anchor to eliminate random GUID drift.
     /// </summary>
     public static string SanitizeKv2Text(string rawKv2)
     {
@@ -358,13 +361,257 @@ public partial class VmapConverterAndSanitizer
         // 3. 将根节点 $prefix_element$ 的 elementid 归一化为全零固定 GUID，以消除 dmxconvert 每次调用重新生成随机 GUID 导致的非确定性。
         // 【关键安全边界】：严禁将此正则匹配范围扩大到全文的其他 elementid！
         // VmapSemanticAnalyzer 将每个实体的 GUID 用作主键，供 AnalyzeVmapSemanticDiff 准确识别实体的
-        // 新增 (Added)、修改 (Modified) 与删除 (Deleted)。若将所有 elementid 归一化，将破坏语义差异分析；
-        // 而 $prefix_element$ 不属于语义类白名单，对其 GUID 进行固定
-        // 既保障了多次转换输出完全一致 (Ordinal-equal)，又完全不会影响下游的任何语义分析与逻辑判定。
+        // 新增 (Added)、修改 (Modified) 与删除 (Deleted)。若将所有主图元 elementid 归一化，将破坏语义差异分析；
+        // 而 $prefix_element$ 不属于语义类白名单，对其 GUID 进行固定既保障一致性，又完全不影响语义判定。
         string step3 = PrefixElementIdRegex().Replace(step2, m =>
             $"{m.Groups[1].Value}00000000-0000-0000-0000-000000000000{m.Groups[3].Value}");
 
-        return step3;
+        // 4. 将所有内联附属子元素（DmElement、Dme*、CDme*、EditGameClassProps 等）的随机 elementid 归一化为基于父级主节点锚点的确定性 GUID。
+        // 主场景节点（CMap* / CVisibilityMgr / CStoredCamera*）原 elementid 保留充当唯一锚点；
+        // 其下所有内联附属子元素（无持久身份、随每次保存随机生成 GUID 者）替换为基于“父级锚点 GUID + 相对路径/下标”经 XxHash128 派生的确定性 GUID。
+        // 彻底根除未变动图元其附属子元素 GUID 随机漂移污染 Git diff 的缺陷。
+        string step4 = NormalizeSubElementIds(step3);
+
+        return step4;
+    }
+
+    private sealed class ScopeFrame
+    {
+        public bool IsArray;
+        public string AnchorGuid = string.Empty;
+        public string RelativePath = string.Empty;
+        public string ArrayName = string.Empty;
+        public int CurrentArrayIndex;
+    }
+
+    private static bool IsAnchorElementClass(ReadOnlySpan<char> className)
+    {
+        if (className.StartsWith("CMap", StringComparison.Ordinal))
+            return true;
+        return className.SequenceEqual("CVisibilityMgr") ||
+               className.SequenceEqual("CStoredCamera") ||
+               className.SequenceEqual("CStoredCameras");
+    }
+
+    private static void FormatDeterministicGuid(string anchorGuid, string relativePath, Span<char> destination)
+    {
+        int maxBytes = (anchorGuid.Length + 1 + relativePath.Length) * 3;
+        byte[]? rented = null;
+        Span<byte> utf8Bytes = maxBytes <= 256 ? stackalloc byte[256] : (rented = ArrayPool<byte>.Shared.Rent(maxBytes));
+
+        try
+        {
+            int written1 = Encoding.UTF8.GetBytes(anchorGuid, utf8Bytes);
+            utf8Bytes[written1] = (byte)'/';
+            int written2 = Encoding.UTF8.GetBytes(relativePath, utf8Bytes[(written1 + 1)..]);
+            int totalBytes = written1 + 1 + written2;
+
+            Span<byte> hash = stackalloc byte[16];
+            XxHash128.Hash(utf8Bytes[..totalBytes], hash);
+
+            // RFC 4122 variant (bits 6..7 = 10) and version 5 (bits 12..15 = 0101)
+            hash[7] = (byte)((hash[7] & 0x0F) | 0x50);
+            hash[8] = (byte)((hash[8] & 0x3F) | 0x80);
+
+            var guid = new Guid(hash);
+            guid.TryFormat(destination, out _);
+        }
+        finally
+        {
+            if (rented != null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// 扫描 KV2 文本并归一化所有内联附属子元素的 elementid。
+    /// 主节点（CMap* / CVisibilityMgr / CStoredCamera*）作为根锚点保持原 GUID 不变；
+    /// 附属子元素（DmElement、Dme*、CDme*、EditGameClassProps 等）的 GUID 替换为由
+    /// "(父锚点 GUID + 相对路径/数组下标)" 经 XxHash128 计算得到的确定性唯一 GUID。
+    /// 替换过程由于 GUID 长度恒为 36 字符，直接原地覆写字符缓冲区，保持格式、缩进与长度严格不变。
+    /// </summary>
+    public static string NormalizeSubElementIds(string kv2Text)
+    {
+        if (string.IsNullOrEmpty(kv2Text))
+            return kv2Text;
+
+        char[] chars = kv2Text.ToCharArray();
+        var stack = new List<ScopeFrame>(32);
+
+        ReadOnlySpan<char> textSpan = kv2Text.AsSpan();
+        int lineStart = 0;
+
+        string lastHeader1 = string.Empty;
+        string lastHeader2 = string.Empty;
+        bool hasPendingHeader = false;
+
+        while (lineStart < textSpan.Length)
+        {
+            int lineEnd = textSpan[lineStart..].IndexOfAny('\r', '\n');
+            int lineLength = lineEnd == -1 ? textSpan.Length - lineStart : lineEnd;
+            ReadOnlySpan<char> line = textSpan.Slice(lineStart, lineLength);
+            ReadOnlySpan<char> trimmed = line.Trim();
+
+            if (trimmed.SequenceEqual("{"))
+            {
+                string className = string.Empty;
+                string propName = string.Empty;
+
+                if (hasPendingHeader)
+                {
+                    if (!string.IsNullOrEmpty(lastHeader2))
+                    {
+                        propName = lastHeader1;
+                        className = lastHeader2;
+                    }
+                    else
+                    {
+                        className = lastHeader1;
+                    }
+                }
+
+                hasPendingHeader = false;
+                bool isAnchor = IsAnchorElementClass(className.AsSpan());
+
+                int nextSearchPos = lineStart + lineLength;
+                if (nextSearchPos < textSpan.Length && textSpan[nextSearchPos] == '\r') nextSearchPos++;
+                if (nextSearchPos < textSpan.Length && textSpan[nextSearchPos] == '\n') nextSearchPos++;
+
+                int idGuidIndexInSource = -1;
+                string currentId = string.Empty;
+
+                int searchLimit = Math.Min(textSpan.Length, nextSearchPos + 300);
+                ReadOnlySpan<char> window = textSpan[nextSearchPos..searchLimit];
+                int idMarker = window.IndexOf("\"id\" \"elementid\" \"", StringComparison.Ordinal);
+                if (idMarker == -1)
+                {
+                    idMarker = window.IndexOf("\"id\"\t\"elementid\"\t\"", StringComparison.Ordinal);
+                }
+
+                if (idMarker != -1)
+                {
+                    int guidStart = nextSearchPos + idMarker + 18;
+                    if (guidStart + 36 <= textSpan.Length && textSpan[guidStart + 36] == '"')
+                    {
+                        idGuidIndexInSource = guidStart;
+                        currentId = new string(chars, guidStart, 36);
+                    }
+                }
+
+                if (idGuidIndexInSource != -1)
+                {
+                    if (className == "$prefix_element$" || isAnchor)
+                    {
+                        stack.Add(new ScopeFrame { IsArray = false, AnchorGuid = currentId, RelativePath = string.Empty });
+                    }
+                    else
+                    {
+                        var parent = stack.Count > 0 ? stack[^1] : null;
+                        string anchorGuid = parent?.AnchorGuid ?? "00000000-0000-0000-0000-000000000000";
+
+                        string relPath;
+                        if (parent != null && parent.IsArray)
+                        {
+                            string seg = $"{parent.ArrayName}[{parent.CurrentArrayIndex}]";
+                            relPath = string.IsNullOrEmpty(parent.RelativePath) ? seg : $"{parent.RelativePath}/{seg}";
+                            parent.CurrentArrayIndex++;
+                        }
+                        else
+                        {
+                            string seg = !string.IsNullOrEmpty(propName) ? propName : className;
+                            string parentRel = parent?.RelativePath ?? string.Empty;
+                            relPath = string.IsNullOrEmpty(parentRel) ? seg : $"{parentRel}/{seg}";
+                        }
+
+                        FormatDeterministicGuid(anchorGuid, relPath, chars.AsSpan(idGuidIndexInSource, 36));
+                        stack.Add(new ScopeFrame { IsArray = false, AnchorGuid = anchorGuid, RelativePath = relPath });
+                    }
+                }
+                else
+                {
+                    stack.Add(new ScopeFrame { IsArray = false });
+                }
+            }
+            else if (trimmed.SequenceEqual("["))
+            {
+                string arrayName = hasPendingHeader ? lastHeader1 : string.Empty;
+                hasPendingHeader = false;
+
+                var parent = stack.Count > 0 ? stack[^1] : null;
+                string parentRel = parent?.RelativePath ?? string.Empty;
+                string anchor = parent?.AnchorGuid ?? string.Empty;
+
+                stack.Add(new ScopeFrame
+                {
+                    IsArray = true,
+                    AnchorGuid = anchor,
+                    RelativePath = parentRel,
+                    ArrayName = arrayName,
+                    CurrentArrayIndex = 0
+                });
+            }
+            else if (trimmed.SequenceEqual("}") || trimmed.SequenceEqual("},"))
+            {
+                hasPendingHeader = false;
+                if (stack.Count > 0) stack.RemoveAt(stack.Count - 1);
+            }
+            else if (trimmed.SequenceEqual("]") || trimmed.SequenceEqual("],"))
+            {
+                hasPendingHeader = false;
+                if (stack.Count > 0) stack.RemoveAt(stack.Count - 1);
+            }
+            else
+            {
+                if (trimmed.Length >= 2 && trimmed[0] == '"' && trimmed[^1] == '"')
+                {
+                    int secondQuote = trimmed[1..].IndexOf('"');
+                    if (secondQuote != -1)
+                    {
+                        ReadOnlySpan<char> tok1 = trimmed.Slice(1, secondQuote);
+                        ReadOnlySpan<char> rest = trimmed[(1 + secondQuote + 1)..].Trim();
+                        if (rest.Length >= 2 && rest[0] == '"' && rest[^1] == '"')
+                        {
+                            int fourthQuote = rest[1..].IndexOf('"');
+                            if (fourthQuote == rest.Length - 2)
+                            {
+                                ReadOnlySpan<char> tok2 = rest.Slice(1, fourthQuote);
+                                lastHeader1 = tok1.ToString();
+                                lastHeader2 = tok2.ToString();
+                                hasPendingHeader = true;
+                            }
+                            else
+                            {
+                                hasPendingHeader = false;
+                            }
+                        }
+                        else if (rest.Length == 0)
+                        {
+                            lastHeader1 = tok1.ToString();
+                            lastHeader2 = string.Empty;
+                            hasPendingHeader = true;
+                        }
+                        else
+                        {
+                            hasPendingHeader = false;
+                        }
+                    }
+                    else
+                    {
+                        hasPendingHeader = false;
+                    }
+                }
+                else
+                {
+                    hasPendingHeader = false;
+                }
+            }
+
+            lineStart += lineLength;
+            if (lineStart < textSpan.Length && textSpan[lineStart] == '\r') lineStart++;
+            if (lineStart < textSpan.Length && textSpan[lineStart] == '\n') lineStart++;
+        }
+
+        return new string(chars);
     }
 
     /// <summary>
